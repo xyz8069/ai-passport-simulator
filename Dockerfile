@@ -60,10 +60,20 @@ FROM python:3.12-slim
 ARG PIP_INDEX_URL=""
 ENV PIP_INDEX_URL=${PIP_INDEX_URL}
 
+# Inherited from the global scope; re-declared here because ARGs do not
+# cross stage boundaries automatically.
+ARG APT_MIRROR=""
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN if [ -n "$APT_MIRROR" ]; then \
+      sed -ri "s|//deb.debian.org|//$APT_MIRROR|g" \
+        /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
+      sed -ri "s|//deb.debian.org|//$APT_MIRROR|g" \
+        /etc/apt/sources.list 2>/dev/null || true; \
+    fi \
+ && apt-get update && apt-get install -y --no-install-recommends \
       libglib2.0-0 libpixman-1-0 zlib1g \
     && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 1000 sim
