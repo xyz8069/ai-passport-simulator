@@ -25,7 +25,7 @@ RUN if [ -n "$APT_MIRROR" ]; then \
     fi \
  && apt-get update && apt-get install -y --no-install-recommends \
       build-essential git curl ca-certificates patch ninja-build pkg-config \
-      python3 python3-venv python3-pip libslirp-dev \
+      python3 python3-venv python3-pip libslirp-dev libgcrypt20-dev \
       libglib2.0-dev libpixman-1-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
