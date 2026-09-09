@@ -9,7 +9,8 @@ FROM ubuntu:24.04 AS qemu-builder
 
 ARG QEMU_BASE_COMMIT=febae182e132e4055529be423a818225ebddaa3a
 # Source snapshot of ${QEMU_BASE_COMMIT}. Override when building on networks
-# without GitHub access, e.g. --build-arg QEMU_SRC_URL=http://172.17.0.1:8001/qemu-src.tar.gz
+# without GitHub access; the override tarball must include the subprojects
+# meson would otherwise fetch via git (at least dtc and keycodemapdb).
 ARG QEMU_SRC_URL=https://codeload.github.com/espressif/qemu/tar.gz/${QEMU_BASE_COMMIT}
 # Optional Ubuntu apt mirror for constrained networks, e.g.
 #   --build-arg APT_MIRROR=mirrors.aliyun.com
@@ -23,7 +24,7 @@ RUN if [ -n "$APT_MIRROR" ]; then \
         /etc/apt/sources.list 2>/dev/null || true; \
     fi \
  && apt-get update && apt-get install -y --no-install-recommends \
-      build-essential curl ca-certificates patch ninja-build pkg-config \
+      build-essential git curl ca-certificates patch ninja-build pkg-config \
       python3 python3-venv python3-pip \
       libglib2.0-dev libpixman-1-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
