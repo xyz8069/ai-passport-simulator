@@ -37,13 +37,13 @@ RUN curl -fsSL -o /tmp/qemu-src.tar.gz "${QEMU_SRC_URL}" \
 
 COPY third_party/qemu/ai-passport-qemu-esp32c3.patch /tmp/qemu.patch
 RUN cd /build/qemu \
+ && export LDFLAGS="-no-pie" \
  && patch -p1 < /tmp/qemu.patch \
  && ./configure --prefix=/opt/qemu \
       --target-list=riscv32-softmmu --disable-gtk --disable-sdl --disable-vnc \
       --disable-curl --disable-opengl --disable-virglrenderer \
       --disable-vhost-user --disable-xkbcommon --disable-docs \
       --disable-tools --disable-werror --disable-pie --disable-guest-agent \
-      LDFLAGS="-no-pie" \
       --enable-fdt=internal --enable-plugins \
  && make -j"$(nproc)" \
  && make install
