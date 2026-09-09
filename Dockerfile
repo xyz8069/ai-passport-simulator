@@ -44,7 +44,7 @@ RUN cd /build/qemu \
       --disable-curl --disable-opengl --disable-virglrenderer \
       --disable-vhost-user --disable-xkbcommon --disable-docs \
       --disable-tools --disable-werror --disable-pie --disable-guest-agent \
-      --enable-fdt=internal --enable-plugins \
+      --enable-fdt=internal \
  && make -j"$(nproc)" \
  && make install
 
