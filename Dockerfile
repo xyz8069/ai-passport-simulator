@@ -25,7 +25,7 @@ RUN if [ -n "$APT_MIRROR" ]; then \
     fi \
  && apt-get update && apt-get install -y --no-install-recommends \
       build-essential git curl ca-certificates patch ninja-build pkg-config \
-      python3 python3-venv python3-pip \
+      python3 python3-venv python3-pip libslirp-dev \
       libglib2.0-dev libpixman-1-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -41,7 +41,7 @@ RUN cd /build/qemu \
  && ./configure --prefix=/opt/qemu \
       --target-list=riscv32-softmmu --disable-gtk --disable-sdl --disable-vnc \
       --disable-curl --disable-opengl --disable-virglrenderer \
-      --disable-vhost-user --disable-slirp --disable-xkbcommon --disable-docs \
+      --disable-vhost-user --disable-xkbcommon --disable-docs \
       --disable-tools --disable-werror --disable-pie \
       --enable-fdt=internal --enable-plugins \
  && make -j"$(nproc)" \
