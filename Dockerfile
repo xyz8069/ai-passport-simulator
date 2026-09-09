@@ -1,0 +1,83 @@
+# syntax=docker/dockerfile:1
+
+# ---------------------------------------------------------------------------
+# Stage 1 — build the AI Passport QEMU customization for Linux.
+#
+# Reproduces the macOS reference build described in third_party/qemu/README.md
+# from the published source patch, so the image ships a GPL-compliant binary
+# built from the same tree as the release assets.
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS qemu-builder
+
+ARG QEMU_BASE_COMMIT=febae182e132e4055529be423a818225ebddaa3a
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential curl ca-certificates patch ninja-build pkg-config \
+      python3 python3-venv python3-pip \
+      libglib2.0-dev libpixman-1-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+# Download the exact upstream base commit the patch was generated against.
+RUN curl -fsSL -o /tmp/qemu-src.tar.gz \
+      "https://codeload.github.com/espressif/qemu/tar.gz/${QEMU_BASE_COMMIT}" \
+ && tar -xzf /tmp/qemu-src.tar.gz \
+ && mv /build/qemu-* /build/qemu
+
+COPY third_party/qemu/ai-passport-qemu-esp32c3.patch /tmp/qemu.patch
+RUN cd /build/qemu \
+ && patch -p1 < /tmp/qemu.patch \
+ && ./configure --prefix=/opt/qemu \
+      --target-list=riscv32-softmmu --disable-gtk --disable-sdl --disable-vnc \
+      --disable-curl --disable-opengl --disable-virglrenderer \
+      --disable-vhost-user --disable-xkbcommon --disable-docs \
+      --disable-tools --disable-werror --disable-pie \
+      --enable-fdt=internal --enable-plugins \
+ && make -j"$(nproc)" \
+ && make install
+
+# ---------------------------------------------------------------------------
+# Stage 2 — runtime image: Flask app + session workers + the built QEMU.
+#
+# The QEMU binary is installed at the simulator's bundled runtime path
+# (<repo>/.runtime/qemu-esp32c3/qemu) so find_qemu() and the JSON Lines
+# input bridge are enabled without extra configuration.
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libglib2.0-0 libpixman-1-0 zlib1g \
+    && rm -rf /var/lib/apt/lists/* \
+ && useradd --create-home --uid 1000 sim
+
+WORKDIR /app
+COPY web/requirements.txt /app/web/requirements.txt
+RUN pip install --no-cache-dir -r web/requirements.txt "gunicorn==23.0.0"
+
+COPY --from=qemu-builder /opt/qemu/bin/qemu-system-riscv32 \
+     /app/.runtime/qemu-esp32c3/qemu/bin/qemu-system-riscv32
+COPY --from=qemu-builder /opt/qemu/share/qemu/ \
+     /app/.runtime/qemu-esp32c3/qemu/share/qemu/
+
+COPY web/ /app/web/
+COPY worker/ /app/worker/
+
+# The app persists sessions, firmware artifacts and snapshots under the
+# Flask instance directory; mount a volume here to keep them across restarts.
+RUN mkdir -p /app/web/instance && chown -R sim:sim /app
+USER sim
+
+EXPOSE 8000
+# The QEMU child processes are owned by the web process, so exactly ONE
+# gunicorn worker must run (--workers 1 is not optional). Threads absorb
+# concurrent SSE streams and API calls; --timeout 0 keeps long-lived SSE
+# connections alive.
+CMD ["gunicorn", "--chdir", "/app/web", \
+     "--workers", "1", "--worker-class", "gthread", "--threads", "12", \
+     "--timeout", "0", "--graceful-timeout", "60", \
+     "--access-logfile", "-", \
+     "--bind", "0.0.0.0:8000", "app:app"]

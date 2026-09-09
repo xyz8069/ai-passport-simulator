@@ -1,0 +1,18 @@
+# Keep the build context small: local runtimes and data must never be baked
+# into the image or shipped to the builder.
+.git
+.runtime
+dist
+demos
+scenarios
+web/instance
+web/.venv
+venv
+**/__pycache__
+**/.pytest_cache
+.playwright-cli
+.DS_Store
+*.log
+notes.md
+task_plan.md
+SIMULATOR_ARCHITECTURE_PLAN.md

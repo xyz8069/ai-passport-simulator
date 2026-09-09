@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Passport // Simulator Deck</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css', v='20260916') }}">
+</head>
+<body>
+  <div class="ambient ambient-one" aria-hidden="true"></div>
+  <div class="ambient ambient-two" aria-hidden="true"></div>
+  <header class="topbar shell">
+    <a class="brand" href="/" aria-label="AI Passport simulator home">
+      <span class="brand-mark"><i></i><i></i></span>
+      <span><strong>AI PASSPORT SIMULATOR</strong><small>OPEN WEARABLE AI AGENT</small></span>
+    </a>
+    <div class="topbar-tools">
+      <button id="lang-toggle" class="lang-toggle" type="button" title="切换语言 / Switch language">中文</button>
+      <a class="site-link-button" href="https://ai-passport.folotoy.cn" target="_blank" rel="noreferrer">
+        <span data-i18n="site.official">官方网站</span><i aria-hidden="true">↗</i>
+      </a>
+      <button id="open-play-catalog" class="catalog-launch-button topbar-catalog-launch" type="button" aria-haspopup="dialog" aria-controls="play-catalog-modal">
+        <span data-i18n="catalog.launch">玩法目录</span>
+        <b data-i18n="catalog.launchSub">OFFICIAL FIRMWARE</b>
+        <i aria-hidden="true">↗</i>
+      </button>
+      <div class="topbar-meta"><span class="live-dot"></span><span id="connection-label" data-i18n="conn.booting">BOOTING RUNTIME</span><span class="mono">v0.1 / WEB</span></div>
+    </div>
+  </header>
+
+  <main class="shell workspace">
+    <section class="device-stage" aria-label="AI Passport virtual device">
+      <div class="stage-label"><span data-i18n="device.label">DEVICE 01</span><span>240 × 320 / RGB565</span></div>
+      <div class="device-presenter">
+        <div class="device-shell">
+          <img class="device-skin" src="{{ url_for('static', filename='assets/ai-passport-front.png') }}" alt="AI Passport device shell">
+          <div class="device-bezel">
+            <div class="screen-glow"></div>
+            <canvas id="screen" width="240" height="320" aria-label="Virtual AI Passport screen"></canvas>
+          </div>
+          <div class="hardware-controls" aria-label="Virtual device controls">
+            <div class="controls-caption" data-i18n="keys.virtual">VIRTUAL KEYS</div>
+            <button class="hardware-button button-up" data-button="UP" aria-label="Up button"><span>UP</span><small>▲</small></button>
+            <button class="hardware-button button-ok" data-button="OK" aria-label="OK button"><span>OK</span><small>●</small></button>
+            <button class="hardware-button button-down" data-button="DOWN" aria-label="Down button"><span>DOWN</span><small>▼</small></button>
+            <div class="controls-caption controls-hint">GPIO0 / ADC</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="control-deck" aria-label="Simulator controls">
+      <div class="deck-heading"><div><div class="eyebrow" data-i18n="deck.eyebrow">CONTROL DECK</div><h2 data-i18n="deck.title">Runtime telemetry</h2></div><span class="status-chip" id="runtime-chip" data-i18n="chip.starting">STARTING</span></div>
+      <div class="telemetry-grid">
+        <div class="telemetry-card wide"><span class="label" data-i18n="label.currentView">CURRENT VIEW</span><strong id="page-value" data-i18n="view.firmwareConsole">FIRMWARE CONSOLE</strong><span class="sub" id="revision-value" data-i18n="revision.dash">REVISION —</span></div>
+        <div class="telemetry-card"><span class="label" data-i18n="label.screenSource">SCREEN SOURCE</span><strong id="firmware-screen-state" data-i18n="status.notLoaded">NOT LOADED</strong><span class="sub" data-i18n="label.realOutput">REAL FIRMWARE OUTPUT</span></div>
+        <div class="telemetry-card"><span class="label" data-i18n="label.inputEvents">INPUT EVENTS</span><strong id="input-count">0</strong><span class="sub" id="input-bridge" data-i18n="bridge.unavailable">UNAVAILABLE</span></div>
+      </div>
+      <div class="deck-section firmware-control">
+        <div class="section-heading"><span data-i18n="fw.lab">FIRMWARE LAB</span><span class="mono" data-i18n="fw.labSub">ONLY SOURCE OF APP BEHAVIOR</span></div>
+        <div class="firmware-upload-row">
+          <label class="file-picker" for="firmware-file"><span id="firmware-file-label" data-i18n="fw.chooseBin">CHOOSE .BIN IMAGE</span><input id="firmware-file" type="file" accept=".bin,application/octet-stream"></label>
+          <button id="firmware-upload" class="service-button compact" data-i18n="fw.loadImage">LOAD IMAGE</button>
+        </div>
+        <select id="firmware-artifact-select" class="firmware-select" aria-label="Validated firmware images">
+          <option value="" data-i18n="fw.select.empty">NO VALIDATED IMAGES</option>
+        </select>
+        <div id="firmware-notice" class="firmware-notice" data-i18n="fw.notice">Upload an ESP-IDF .bin to inspect its image header.</div>
+        <div class="firmware-facts">
+          <div><span class="label" data-i18n="label.chipFormat">CHIP / FORMAT</span><strong id="firmware-chip">—</strong><span class="sub" id="firmware-format">—</span></div>
+          <div><span class="label" data-i18n="label.entry">ENTRY ADDRESS</span><strong id="firmware-entry">—</strong><span class="sub" id="firmware-size">—</span></div>
+          <div class="firmware-fact-wide"><span class="label">SHA-256</span><strong id="firmware-sha256">—</strong></div>
+        <div class="firmware-fact-wide"><span class="label" data-i18n="label.partitions">PARTITIONS</span><strong id="firmware-partitions">—</strong></div>
+        <div class="firmware-fact-wide"><span class="label" data-i18n="label.source">SOURCE</span><strong id="firmware-source" data-i18n="source.localUpload">LOCAL UPLOAD</strong></div>
+        </div>
+        <div class="firmware-actions">
+          <button id="firmware-analyze" class="service-button"><span data-i18n="fw.analyze">ANALYZE</span> <b data-i18n="fw.analyzeSub">VERIFY IMAGE</b></button>
+          <button id="firmware-run" class="service-button"><span data-i18n="fw.run">RUN FIRMWARE</span> <b data-i18n="fw.runSub">ESP32-C3 BACKEND</b></button>
+          <button id="firmware-stop" class="service-button"><span data-i18n="fw.stop">STOP EXECUTION</span> <b data-i18n="fw.stopSub">TERMINATE QEMU</b></button>
+        </div>
+        <div class="firmware-runtime-row"><span class="label" data-i18n="label.execution">EXECUTION</span><strong id="firmware-run-state" data-i18n="fwStatus.notRunning">NOT RUNNING</strong><span class="sub" id="firmware-run-reason" data-i18n="exec.reasonUnknown">QEMU status unknown</span></div>
+        <pre id="firmware-log" class="firmware-log" data-i18n="fw.logEmpty">QEMU output will appear here.</pre>
+      </div>
+      <div class="deck-section">
+        <div class="section-heading"><span data-i18n="bus.input">INPUT BUS</span><span class="mono">GPIO0 / ADC</span></div>
+        <div class="key-map"><button data-button="UP"><kbd>↑</kbd><span data-i18n="key.up">UP</span></button><button data-button="OK"><kbd>↵</kbd><span data-i18n="key.ok">OK</span></button><button data-button="DOWN"><kbd>↓</kbd><span data-i18n="key.down">DOWN</span></button></div>
+        <p class="hint">按键事件只作为输入发送给固件后端；未连接输入协议时不会改变屏幕内容。按住任意虚拟按键 0.85 秒会发送一次 LONG（长按）事件，短按发送 PRESS。</p>
+      </div>
+      <div class="deck-section audio-section">
+        <div class="section-heading"><span data-i18n="bus.audio">AUDIO BUS</span><span class="mono" id="audio-bridge" data-i18n="bridge.unavailable">UNAVAILABLE</span></div>
+        <div class="audio-controls">
+          <button id="audio-speaker" class="audio-toggle" type="button" aria-pressed="false"><span data-i18n="audio.speaker">SPEAKER</span><b data-i18n="state.off">OFF</b></button>
+          <button id="audio-mic" class="audio-toggle" type="button" aria-pressed="false"><span data-i18n="audio.mic">MICROPHONE</span><b data-i18n="state.off">OFF</b></button>
+        </div>
+        <p class="hint" id="audio-status" data-i18n="audio.statusIdle">扬声器与麦克风等待固件后端提供音频桥；后端未输出音频帧时不会伪造声音。</p>
+      </div>
+      <div class="deck-section event-section">
+        <div class="section-heading"><span data-i18n="stream.title">EVENT STREAM</span><button id="reset-button" class="text-button" data-i18n="device.reset">RESET DEVICE</button></div>
+        <div id="log-list" class="log-list"><div class="empty-state" data-i18n="logs.waiting">waiting for worker telemetry…</div></div>
+      </div>
+      <div class="deck-footer"><span class="worker-led"></span><span data-i18n="worker.isolated">ISOLATED WORKER</span><span class="mono" id="session-value" data-i18n="session.dash">SESSION —</span></div>
+    </aside>
+  </main>
+  <div id="play-catalog-modal" class="play-catalog-modal" hidden>
+    <div class="play-catalog-backdrop" data-play-catalog-close aria-hidden="true"></div>
+    <section class="play-catalog-dialog" role="dialog" aria-modal="true" aria-labelledby="play-catalog-title" tabindex="-1">
+      <div class="catalog-heading">
+        <div>
+          <div class="eyebrow" id="play-catalog-eyebrow" data-i18n="catalog.eyebrowLoading">OFFICIAL PLAY CATALOG / LOADING</div>
+          <h2 id="play-catalog-title" data-i18n="catalog.launch">玩法目录</h2>
+          <p>浏览 ai-passport 官方目录中的真实项目。下载后会先验证 SHA-256 与 ESP32-C3 镜像，再进入固件运行链路。</p>
+          <a class="catalog-source-link" href="https://ai-passport.folotoy.cn/plays/" target="_blank" rel="noreferrer" data-i18n="catalog.playsPage">官方玩法页面 ↗</a>
+        </div>
+        <div class="catalog-heading-actions">
+          <div class="catalog-meta"><span id="play-catalog-count">—</span><span id="play-catalog-source" data-i18n="catalog.source">OFFICIAL SOURCE</span></div>
+          <button id="close-play-catalog" class="modal-close-button" type="button" aria-label="关闭玩法目录"><span data-i18n="catalog.close">关闭目录</span><b>ESC</b></button>
+        </div>
+      </div>
+      <div class="catalog-toolbar">
+        <label class="catalog-search"><span class="sr-only">搜索玩法</span><input id="play-search" type="search" placeholder="搜索标题、作者或关键词" autocomplete="off" data-i18n-placeholder="catalog.searchPlaceholder"></label>
+        <select id="play-category" class="catalog-filter" aria-label="按分类筛选">
+          <option value="" data-i18n="catalog.allCategories">全部分类</option>
+        </select>
+        <button id="play-refresh" class="service-button compact" type="button" data-i18n="catalog.refresh">刷新目录</button>
+      </div>
+      <div class="catalog-layout">
+        <div id="play-list" class="play-list" aria-live="polite"><div class="catalog-empty" data-i18n="catalog.loading">正在从官方源读取玩法目录…</div></div>
+        <article id="play-detail" class="play-detail" aria-live="polite">
+          <div class="detail-kicker" data-i18n="detail.select">SELECT A PLAY</div>
+          <h3 id="play-detail-title" data-i18n="detail.select">选择一个玩法</h3>
+          <p id="play-detail-description" data-i18n="detail.default">项目说明、固件版本与校验信息会显示在这里。</p>
+          <div id="play-detail-tags" class="play-tags"></div>
+          <div class="play-facts">
+            <div><span class="label" data-i18n="detail.author">AUTHOR</span><strong id="play-detail-author">—</strong></div>
+            <div><span class="label" data-i18n="detail.firmware">FIRMWARE</span><strong id="play-detail-size">—</strong></div>
+            <div><span class="label" data-i18n="detail.format">FORMAT</span><strong id="play-detail-format">—</strong></div>
+            <div><span class="label" data-i18n="detail.status">STATUS</span><strong id="play-detail-status">—</strong></div>
+            <div class="play-fact-wide"><span class="label">SHA-256</span><strong id="play-detail-sha">—</strong></div>
+          </div>
+          <div class="play-detail-actions">
+            <button id="play-download" class="service-button" type="button" disabled><span data-i18n="play.download">下载并加载</span><b data-i18n="play.downloadSub">VALIDATE + LOAD</b></button>
+            <button id="play-run" class="service-button" type="button" disabled><span data-i18n="play.run">下载并运行</span><b data-i18n="play.runSub">VALIDATE + RUN QEMU</b></button>
+          </div>
+          <a id="play-github" class="play-link" href="#" target="_blank" rel="noreferrer" hidden data-i18n="play.github">打开项目主页 ↗</a>
+          <div id="play-notice" class="play-notice" data-i18n="play.notice">目录固件只从官方服务器获取。</div>
+        </article>
+      </div>
+    </section>
+  </div>
+  <footer class="shell footer"><span>WEAR · PLAY · CREATE</span><span>AI PASSPORT SIMULATOR</span><span>LOCAL / SQLITE</span></footer>
+  <script src="{{ url_for('static', filename='app.js', v='20260916') }}"></script>
+</body>
+</html>

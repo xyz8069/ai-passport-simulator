@@ -1,0 +1,3225 @@
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index 36a9ace..e3a3fb4 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -31,7 +31,7 @@ system_ss.add(when: 'CONFIG_TCX', if_true: files('tcx.c'))
+ system_ss.add(when: 'CONFIG_CG3', if_true: files('cg3.c'))
+ system_ss.add(when: 'CONFIG_MACFB', if_true: files('macfb.c'))
+ system_ss.add(when: 'CONFIG_NEXTCUBE', if_true: files('next-fb.c'))
+-system_ss.add(when: 'CONFIG_ESP_RGB', if_true: files('esp_rgb.c'))
++system_ss.add(when: 'CONFIG_ESP_RGB', if_true: files('esp_rgb.c', 'st7789.c'))
+ 
+ system_ss.add(when: 'CONFIG_VGA', if_true: files('vga.c'))
+ system_ss.add(when: 'CONFIG_VIRTIO', if_true: files('virtio-dmabuf.c'))
+diff --git a/hw/display/st7789.c b/hw/display/st7789.c
+new file mode 100644
+index 0000000..e2507ba
+--- /dev/null
++++ b/hw/display/st7789.c
+@@ -0,0 +1,239 @@
++#include "qemu/osdep.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "hw/display/st7789.h"
++
++/* Temporary bounded diagnostics for firmware display bring-up. */
++#define ST7789_TRACE_LIMIT 64
++#define ST7789_FRAME_INTERVAL_MS 33
++static unsigned st7789_trace_count;
++
++static void st7789_trace(const char *op, const ST7789State *s, uint8_t value)
++{
++    if (st7789_trace_count >= ST7789_TRACE_LIMIT) {
++        return;
++    }
++    fprintf(stderr,
++            "[ST7789 TRACE] %s dc=%d cmd=0x%02x value=0x%02x x=%u y=%u pixels=%u\\n",
++            op, s->dc_level, s->current_command, value,
++            s->current_x, s->current_y, s->pixel_count);
++    st7789_trace_count++;
++}
++
++static void st7789_dc_set(void *opaque, int n, int level)
++{
++    ST7789State *s = ST7789(opaque);
++
++    if (n == 0) {
++        s->dc_level = !!level;
++        st7789_trace("DC", s, (uint8_t)s->dc_level);
++    }
++}
++
++static void st7789_set_window(ST7789State *s, bool column)
++{
++    const uint16_t start = ((uint16_t)s->command_data[0] << 8) |
++                           s->command_data[1];
++    const uint16_t end = ((uint16_t)s->command_data[2] << 8) |
++                         s->command_data[3];
++
++    if (column) {
++        s->column_start = MIN(start, ST7789_WIDTH - 1);
++        s->column_end = MIN(end, ST7789_WIDTH - 1);
++        s->current_x = s->column_start;
++    } else {
++        s->row_start = MIN(start, ST7789_HEIGHT - 1);
++        s->row_end = MIN(end, ST7789_HEIGHT - 1);
++        s->current_y = s->row_start;
++    }
++    s->window_pixel_count = 0;
++    s->window_complete = false;
++}
++
++static void st7789_write_pixel(ST7789State *s, uint8_t low)
++{
++    const size_t offset = ((size_t)s->current_y * ST7789_WIDTH + s->current_x) * 2;
++
++    if (offset + 1 < sizeof(s->framebuffer)) {
++        /* The panel receives RGB565 most-significant byte first.  The Web
++         * canvas consumes the captured framebuffer as little-endian RGB565. */
++        s->framebuffer[offset] = low;
++        s->framebuffer[offset + 1] = s->pending_pixel;
++        s->pixel_count++;
++        s->window_pixel_count++;
++        if (s->window_pixel_count >=
++            (uint32_t)(s->column_end - s->column_start + 1) *
++            (uint32_t)(s->row_end - s->row_start + 1)) {
++            s->window_complete = true;
++        }
++    }
++
++    if (s->current_x < s->column_end) {
++        s->current_x++;
++    } else {
++        s->current_x = s->column_start;
++        if (s->current_y < s->row_end) {
++            s->current_y++;
++        } else {
++            s->current_y = s->row_start;
++        }
++    }
++}
++
++static uint32_t st7789_transfer(SSIPeripheral *dev, uint32_t value)
++{
++    ST7789State *s = ST7789(dev);
++    const uint8_t byte = value & 0xff;
++
++    if (!s->dc_level) {
++        s->current_command = byte;
++        s->command_data_len = 0;
++        s->pending_pixel_high = false;
++        s->ramwr_active = byte == 0x2c;
++        if (s->ramwr_active) {
++            s->window_pixel_count = 0;
++            s->window_complete = false;
++        }
++        st7789_trace("CMD", s, byte);
++        switch (byte) {
++        case 0x29:
++            s->display_on = true;
++            break;
++        case 0x20:
++            s->invert_color = false;
++            break;
++        case 0x21:
++            s->invert_color = true;
++            break;
++        default:
++            break;
++        }
++        return 0;
++    }
++
++    if (s->ramwr_active) {
++        if (s->pixel_count < 4) {
++            st7789_trace("PIX", s, byte);
++        }
++        if (!s->pending_pixel_high) {
++            s->pending_pixel = byte;
++            s->pending_pixel_high = true;
++        } else {
++            st7789_write_pixel(s, byte);
++            s->pending_pixel_high = false;
++        }
++        return 0;
++    }
++
++    if (s->command_data_len < sizeof(s->command_data)) {
++        s->command_data[s->command_data_len++] = byte;
++        st7789_trace("PARAM", s, byte);
++    }
++
++    if (s->command_data_len == 4) {
++        switch (s->current_command) {
++        case 0x2a:
++            st7789_set_window(s, true);
++            break;
++        case 0x2b:
++            st7789_set_window(s, false);
++            break;
++        default:
++            break;
++        }
++    }
++
++    return 0;
++}
++
++static bool st7789_emit_frame(ST7789State *s)
++{
++    if (s->emitted_frame_valid &&
++        memcmp(s->emitted_framebuffer, s->framebuffer, sizeof(s->framebuffer)) == 0) {
++        return false;
++    }
++
++    memcpy(s->emitted_framebuffer, s->framebuffer, sizeof(s->framebuffer));
++    s->emitted_frame_valid = true;
++    s->frame_revision++;
++    g_autofree gchar *encoded = g_base64_encode(s->framebuffer,
++                                                sizeof(s->framebuffer));
++
++    g_print("{\"type\":\"frame\",\"width\":%u,\"height\":%u,"
++            "\"format\":\"rgb565-le\",\"frame_revision\":%" PRIu64 ","
++            "\"frame_rgb565_b64\":\"%s\"}\n",
++            ST7789_WIDTH, ST7789_HEIGHT, s->frame_revision, encoded);
++    fflush(stdout);
++    /* Frame forwarding is a host-side transport throttle.  The guest may
++     * spend a long time in a DMA/driver polling loop without advancing
++     * QEMU's virtual clock, so use host time here. */
++    s->last_frame_ms = qemu_clock_get_ms(QEMU_CLOCK_HOST);
++    return true;
++}
++
++static int st7789_set_cs(SSIPeripheral *dev, bool level)
++{
++    ST7789State *s = ST7789(dev);
++
++    st7789_trace(level ? "CS_HIGH" : "CS_LOW", s, (uint8_t)level);
++
++    if (level && s->pixel_count > 0) {
++        const int64_t now = qemu_clock_get_ms(QEMU_CLOCK_HOST);
++
++        /* LVGL flushes row-sized DMA buffers.  Keep every SPI write in the
++         * real panel framebuffer, but only serialize its complete state at a
++         * display-like cadence so stdout cannot stall the guest. */
++        if (s->last_frame_ms < 0 ||
++            now - s->last_frame_ms >= ST7789_FRAME_INTERVAL_MS) {
++            st7789_emit_frame(s);
++            s->window_complete = false;
++        }
++        s->pixel_count = 0;
++    }
++    return 0;
++}
++
++static void st7789_realize(SSIPeripheral *dev, Error **errp)
++{
++    ST7789State *s = ST7789(dev);
++
++    s->column_end = ST7789_WIDTH - 1;
++    s->row_end = ST7789_HEIGHT - 1;
++    s->colmod = 0x55;
++    qdev_init_gpio_in_named(DEVICE(s), st7789_dc_set, "dc", 1);
++}
++
++static void st7789_init(Object *obj)
++{
++    ST7789State *s = ST7789(obj);
++
++    memset(s->framebuffer, 0, sizeof(s->framebuffer));
++    memset(s->emitted_framebuffer, 0, sizeof(s->emitted_framebuffer));
++    s->dc_level = true;
++    s->last_frame_ms = -1;
++}
++
++static void st7789_class_init(ObjectClass *klass, void *data)
++{
++    SSIPeripheralClass *sc = SSI_PERIPHERAL_CLASS(klass);
++
++    sc->realize = st7789_realize;
++    sc->transfer = st7789_transfer;
++    sc->set_cs = st7789_set_cs;
++    sc->cs_polarity = SSI_CS_LOW;
++}
++
++static const TypeInfo st7789_info = {
++    .name = TYPE_ST7789,
++    .parent = TYPE_SSI_PERIPHERAL,
++    .instance_size = sizeof(ST7789State),
++    .instance_init = st7789_init,
++    .class_init = st7789_class_init,
++};
++
++static void st7789_register_types(void)
++{
++    type_register_static(&st7789_info);
++}
++
++type_init(st7789_register_types)
+diff --git a/hw/dma/esp32c3_gdma.c b/hw/dma/esp32c3_gdma.c
+index 20bee36..994eadc 100644
+--- a/hw/dma/esp32c3_gdma.c
++++ b/hw/dma/esp32c3_gdma.c
+@@ -15,6 +15,22 @@
+ #define DIM(arr) (sizeof(arr)/sizeof(*arr))
+ #define ESP32C3_GDMA_WARNING    0
+ #define ESP32C3_GDMA_DEBUG      0
++#define ESP32C3_GDMA_TRACE_LIMIT 1200
++
++static unsigned esp32c3_gdma_trace_count;
++
++static void esp32c3_gdma_trace(const char *op, hwaddr addr, uint32_t value)
++{
++    if (esp32c3_gdma_trace_count >= ESP32C3_GDMA_TRACE_LIMIT) {
++        return;
++    }
++    vaddr pc = current_cpu && current_cpu->cc->get_pc
++        ? current_cpu->cc->get_pc(current_cpu) : 0;
++    fprintf(stderr,
++            "[ESP32-C3 GDMA TRACE] %s pc=0x%08llx off=0x%03llx value=0x%08x\\n",
++            op, (unsigned long long)pc, (unsigned long long)addr, value);
++    esp32c3_gdma_trace_count++;
++}
+ 
+ 
+ typedef struct {
+@@ -39,6 +55,11 @@ const ESP32C3IntMapping int_mapping[] = {
+     { .specific = R_DMA_INT_RAW_OUT_DONE_MASK,      .generic = R_GDMA_INTERRUPT_OUT_DONE_MASK      },
+ };
+ 
++/* The C3 register has five RX events followed by four TX events.  Keep this
++ * explicit instead of using DIM(int_mapping) / 2: the two directions are not
++ * the same size, and splitting the table in half maps IN_DONE to OUT. */
++#define ESP32C3_GDMA_IN_EVENT_COUNT 5
++
+ 
+ /**
+  * @brief Extract and generate a generic interrupt bitmap for IN and OUT channels out of an ESP32-C3 interrupt bitmap.
+@@ -51,7 +72,7 @@ static void esp32c3_to_int_bitmask(uint32_t value, uint32_t *in_value, uint32_t
+     int i = 0;
+ 
+     /* IN bitmasks are first in the mapping */
+-    for (i = 0; i < DIM(int_mapping) / 2; i++) {
++    for (i = 0; i < ESP32C3_GDMA_IN_EVENT_COUNT; i++) {
+         if (value & int_mapping[i].specific) {
+             *in_value |= int_mapping[i].generic;
+         }
+@@ -75,7 +96,7 @@ static uint32_t esp32c3_from_int_bitmask(uint32_t in_value, uint32_t out_value)
+     int i = 0;
+     uint32_t r = 0;
+ 
+-    for (i = 0; i < DIM(int_mapping) / 2; i++) {
++    for (i = 0; i < ESP32C3_GDMA_IN_EVENT_COUNT; i++) {
+         if (in_value & int_mapping[i].generic) {
+             r |= int_mapping[i].specific;
+         }
+@@ -145,8 +166,8 @@ static DmaRegister esp32c3_generic_reg(uint32_t reg)
+ static uint32_t esp32c3_read_int_register(ESP32C3GdmaState *s, hwaddr addr)
+ {
+     /* Check which channel and which direction is being written to */
+-    const uint32_t chan = addr / DMA_DIR_REGS_SIZE;
+-    const uint32_t reg  = addr % DMA_DIR_REGS_SIZE;
++    const uint32_t chan = addr / ESP_GDMA_INT_REGS_SIZE;
++    const uint32_t reg  = addr % ESP_GDMA_INT_REGS_SIZE;
+     const uint32_t generic_reg = esp32c3_generic_int_reg(reg);
+ 
+     uint32_t in_value  = esp_gdma_read_chan_register(&s->parent, ESP_GDMA_IN_IDX, chan, generic_reg);
+@@ -178,13 +199,17 @@ static uint64_t esp32c3_gdma_read(void *opaque, hwaddr addr, unsigned int size)
+      * finally the channels configurtaion registers */
+     switch (addr) {
+         case DMA_INT_CHAN_REGS_START ... DMA_INT_CHAN_REGS_END:
+-            return esp32c3_read_int_register(s, addr - DMA_INT_CHAN_REGS_START);
++            r = esp32c3_read_int_register(s, addr - DMA_INT_CHAN_REGS_START);
++            esp32c3_gdma_trace("R", addr, (uint32_t)r);
++            return r;
+ 
+         case A_DMA_MISC_CONF:
+             return esp_gdma_read_register(parent, GDMA_MISC_REG);
+ 
+         case DMA_CHAN_REGS_START ... DMA_CHAN_REGS_END:
+-            return esp32c3_read_chan_register(s, addr - DMA_CHAN_REGS_START);
++            r = esp32c3_read_chan_register(s, addr - DMA_CHAN_REGS_START);
++            esp32c3_gdma_trace("R", addr, (uint32_t)r);
++            return r;
+ 
+         default:
+         /* Unknown or dummy register */
+@@ -205,8 +230,8 @@ static uint64_t esp32c3_gdma_read(void *opaque, hwaddr addr, unsigned int size)
+ static void esp32c3_write_int_register(ESP32C3GdmaState *s, hwaddr addr, uint32_t value)
+ {
+     /* Check which channel and which direction is being written to */
+-    const uint32_t chan = addr / DMA_DIR_REGS_SIZE;
+-    const uint32_t reg  = addr % DMA_DIR_REGS_SIZE;
++    const uint32_t chan = addr / ESP_GDMA_INT_REGS_SIZE;
++    const uint32_t reg  = addr % ESP_GDMA_INT_REGS_SIZE;
+     uint32_t in_value = 0;
+     uint32_t out_value = 0;
+ 
+@@ -239,6 +264,8 @@ static void esp32c3_gdma_write(void *opaque, hwaddr addr,
+     info_report("[C3][GDMA] Writing to %08lx (%08lx)", addr, value);
+ #endif
+ 
++    esp32c3_gdma_trace("W", addr, (uint32_t)value);
++
+     /* The registers on the ESP32-C3 start with the interrupt registers, then come the misc registers, and
+      * finally the channels configurtaion registers */
+     switch (addr) {
+diff --git a/hw/dma/esp_gdma.c b/hw/dma/esp_gdma.c
+index 6640fca..d53529d 100644
+--- a/hw/dma/esp_gdma.c
++++ b/hw/dma/esp_gdma.c
+@@ -14,6 +14,26 @@
+ #include "hw/sysbus.h"
+ #include "hw/irq.h"
+ #include "hw/dma/esp_gdma.h"
++
++#define ESP_GDMA_TRACE_LIMIT 1200
++static unsigned esp_gdma_trace_count;
++static unsigned esp_gdma_memory_trace_count;
++static unsigned esp_gdma_i2s_trace_count;
++typedef struct GdmaLinkedList GdmaLinkedList;
++
++static void esp_gdma_trace(const char *op, uint32_t dir, uint32_t chan,
++                           DmaRegister reg, uint32_t value)
++{
++    if (esp_gdma_trace_count >= ESP_GDMA_TRACE_LIMIT) {
++        return;
++    }
++    vaddr pc = current_cpu && current_cpu->cc->get_pc
++        ? current_cpu->cc->get_pc(current_cpu) : 0;
++    fprintf(stderr,
++            "[ESP GDMA TRACE] %s pc=0x%08llx dir=%u chan=%u reg=%d value=0x%08x\\n",
++            op, (unsigned long long)pc, dir, chan, reg, value);
++    esp_gdma_trace_count++;
++}
+ #include "hw/qdev-properties.h"
+ #include "hw/qdev-properties-system.h"
+ #include "qemu/error-report.h"
+@@ -25,7 +45,7 @@
+ /**
+  * @brief Structure defining how linked lists are represented in hardware for the GDMA module
+  */
+-typedef struct GdmaLinkedList {
++struct GdmaLinkedList {
+     union {
+         struct {
+             uint32_t size: 12;   // Size of the buffer (mainly used in a receive transaction)
+@@ -44,7 +64,36 @@ typedef struct GdmaLinkedList {
+     } config;
+     uint32_t buf_addr;
+     uint32_t next_addr;
+-} GdmaLinkedList;
++};
++
++static void esp_gdma_i2s_trace(const char *op, uint32_t dir, uint32_t chan,
++                               uint32_t addr, const GdmaLinkedList *desc,
++                               const uint8_t *data, uint32_t len, bool ok)
++{
++    if (esp_gdma_i2s_trace_count >= 256) {
++        return;
++    }
++    uint32_t nonzero = 0;
++    if (data != NULL) {
++        for (uint32_t i = 0; i < len; ++i) {
++            nonzero += data[i] != 0;
++        }
++    }
++    fprintf(stderr,
++            "[ESP GDMA I2S] %s dir=%u chan=%u desc=0x%08x owner=%u length=%u size=%u buf=0x%08x next=0x%08x ok=%d data_len=%u nonzero=%u first=%02x%02x%02x%02x\n",
++            op, dir, chan, addr,
++            desc ? desc->config.owner : 0,
++            desc ? desc->config.length : 0,
++            desc ? desc->config.size : 0,
++            desc ? desc->buf_addr : 0,
++            desc ? desc->next_addr : 0,
++            ok, len, nonzero,
++            data && len > 0 ? data[0] : 0,
++            data && len > 1 ? data[1] : 0,
++            data && len > 2 ? data[2] : 0,
++            data && len > 3 ? data[3] : 0);
++    esp_gdma_i2s_trace_count++;
++}
+ 
+ 
+ /**
+@@ -179,6 +228,21 @@ static bool esp_gdma_write_descr(ESPGdmaState *s, uint32_t addr, GdmaLinkedList*
+ static bool esp_gdma_read_guest(ESPGdmaState *s, uint32_t addr, void* data, uint32_t len)
+ {
+     MemTxResult res = dma_memory_read(&s->dma_as, addr, data, len, MEMTXATTRS_UNSPECIFIED);
++    if (esp_gdma_memory_trace_count < 32 && len > 0) {
++        const uint8_t *bytes = data;
++        uint32_t nonzero = 0;
++        for (uint32_t i = 0; i < len; ++i) {
++            nonzero += bytes[i] != 0;
++        }
++        fprintf(stderr,
++                "[ESP GDMA MEM] addr=0x%08x len=%u result=%d nonzero=%u first=%02x%02x%02x%02x\n",
++                addr, len, res, nonzero,
++                bytes[0],
++                len > 1 ? bytes[1] : 0,
++                len > 2 ? bytes[2] : 0,
++                len > 3 ? bytes[3] : 0);
++        esp_gdma_memory_trace_count++;
++    }
+     return res == MEMTX_OK;
+ }
+ 
+@@ -212,6 +276,14 @@ static void esp_gdma_push_descriptor(ESPGdmaState *s, uint32_t chan, uint32_t di
+     /* On real hardware, state->bfr_desc_addr is taken from state->desc_addr, even is `current` is valid */
+     state->bfr_desc_addr = state->desc_addr;
+ 
++    /* A zero next pointer terminates a descriptor chain.  Real hardware does
++     * not dereference address zero, and doing so here turns a completed DMA
++     * transfer into a stream of invalid descriptor reads. */
++    if (current == 0) {
++        state->desc_addr = 0;
++        return;
++    }
++
+     /* Get the next address out of the guest RAM */
+     const bool valid = esp_gdma_read_descr(s, current, &next_node);
+     if (valid) {
+@@ -233,6 +305,9 @@ static void esp_gdma_push_descriptor(ESPGdmaState *s, uint32_t chan, uint32_t di
+ static inline bool esp_gdma_next_list_node(ESPGdmaState *s, uint32_t chan, uint32_t dir, GdmaLinkedList* node)
+ {
+     const uint32_t current = node->next_addr;
++    if (current == 0) {
++        return false;
++    }
+     esp_gdma_push_descriptor(s, chan, dir, current);
+     return esp_gdma_read_descr(s, current, node);
+ }
+@@ -277,8 +352,7 @@ bool esp_gdma_get_channel_periph(ESPGdmaState *s, GdmaPeripheral periph, int dir
+     for (int i = 0; i < class->m_channel_count; i++) {
+         /* IN/OUT PERI registers have the same organization, can use any macro.
+          * Look for the channel that was configured with the given peripheral. It must be marked as "started" too */
+-        if ( FIELD_EX32(s->ch_conf[dir][i].peripheral, GDMA_PERI_SEL, PERI_SEL) == periph ||
+-             FIELD_EX32(s->ch_conf[dir][i].link, GDMA_OUT_LINK, START)) {
++        if (FIELD_EX32(s->ch_conf[dir][i].peripheral, GDMA_PERI_SEL, PERI_SEL) == periph) {
+ 
+             *chan = i;
+             return true;
+@@ -293,7 +367,9 @@ bool esp_gdma_get_channel_periph(ESPGdmaState *s, GdmaPeripheral periph, int dir
+  * @brief Read data from guest RAM pointed by the linked list configured in the given DmaConfigState index.
+  *        `size` bytes will be read and stored in `buffer`.
+  */
+-bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint32_t size)
++static bool esp_gdma_read_channel_at(ESPGdmaState *s, uint32_t chan,
++                                     uint8_t* buffer, uint32_t size,
++                                     uint32_t first_addr)
+ {
+     DmaConfigState* state = &s->ch_conf[ESP_GDMA_OUT_IDX][chan];
+ 
+@@ -303,8 +379,14 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
+     esp_gdma_clear_status(&state->int_state, R_GDMA_INTERRUPT_OUT_DONE_MASK |
+                                              R_GDMA_INTERRUPT_OUT_EOF_MASK);
+ 
+-    /* Get the guest DRAM address */
+-    uint32_t out_addr = ((ESP_GDMA_RAM_ADDR >> 20) << 20) | FIELD_EX32(state->link, GDMA_OUT_LINK, ADDR);
++    /* Get the guest DRAM address selected by the caller.  A streaming
++     * peripheral may resume at state->desc_addr instead of the original
++     * OUT_LINK address after the first descriptor has completed. */
++    uint32_t out_addr = first_addr;
++
++    if (esp_gdma_trace_count < ESP_GDMA_TRACE_LIMIT) {
++        esp_gdma_trace("TX_BEGIN", ESP_GDMA_OUT_IDX, chan, GDMA_LINK_REG, state->link);
++    }
+ 
+     /* Boolean to mark whether we need to check the owner for in and out buffers */
+     const bool owner_check_out = FIELD_EX32(state->conf1, GDMA_OUT_CONF1, CHECK_OWNER);
+@@ -322,6 +404,17 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
+     valid = esp_gdma_read_descr(s, out_addr, &out_list);
+     esp_gdma_push_descriptor(s, chan, ESP_GDMA_OUT_IDX, out_addr);
+ 
++    if (esp_gdma_trace_count < ESP_GDMA_TRACE_LIMIT) {
++        esp_gdma_trace("TX_DESC", ESP_GDMA_OUT_IDX, chan, GDMA_DESC_ADDR_REG,
++                       out_addr);
++        fprintf(stderr,
++                "[ESP GDMA TRACE] TX_DESC_DATA owner=%u length=%u size=%u buf=0x%08x next=0x%08x valid=%d\\n",
++                out_list.config.owner, out_list.config.length,
++                out_list.config.size, out_list.buf_addr, out_list.next_addr,
++                valid);
++        esp_gdma_trace_count++;
++    }
++
+     /* Check that the address is valid. If the owner must be checked, make sure owner is the DMA controller.
+      * On the real hardware, both in and out are checked at the same time, so in case of an error, both bits
+      * are set. Replicate the same behavior here. */
+@@ -330,6 +423,11 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
+         return false;
+     }
+ 
++    if (FIELD_EX32(state->peripheral, GDMA_PERI_SEL, PERI_SEL) == GDMA_I2S0) {
++        esp_gdma_i2s_trace("TX_DESC", ESP_GDMA_OUT_IDX, chan, out_addr,
++                           &out_list, NULL, 0, true);
++    }
++
+     /* Store the current number of bytes written to `buffer` parameter */
+     uint32_t consumed = 0;
+     bool exit_loop = false;
+@@ -348,6 +446,11 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
+         }
+         consumed += min;
+ 
++        if (FIELD_EX32(state->peripheral, GDMA_PERI_SEL, PERI_SEL) == GDMA_I2S0) {
++            esp_gdma_i2s_trace("TX_DATA", ESP_GDMA_OUT_IDX, chan, out_addr,
++                               &out_list, buffer + consumed - min, min, valid);
++        }
++
+         if (consumed == size) {
+             exit_loop = true;
+         }
+@@ -366,7 +469,24 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
+ 
+             const bool eof_bit = out_list.config.suc_eof;
+ 
+-            /* Retrieve the next node  while updating the virtual guest address */
++            /* OUT EOF is the descriptor-level completion event used by
++             * streaming peripherals.  The C3 driver also reads the EOF
++             * descriptor address from the DMA block to recycle that node. */
++            if (eof_bit) {
++                state->suc_eof_desc_addr = out_addr;
++                esp_gdma_set_status(&state->int_state,
++                                    R_GDMA_INTERRUPT_OUT_EOF_MASK |
++                                    R_GDMA_INTERRUPT_OUT_TOTAL_EOF_MASK);
++            }
++
++            /* Do not fetch another descriptor after the requested byte count
++             * has already been consumed.  In particular, the last descriptor
++             * commonly has next_addr == 0. */
++            if (exit_loop) {
++                break;
++            }
++
++            /* Retrieve the next node while updating the virtual guest address. */
+             out_addr = out_list.next_addr;
+             valid = esp_gdma_next_list_node(s, chan, ESP_GDMA_OUT_IDX, &out_list);
+ 
+@@ -376,12 +496,9 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
+                 error = true;
+             }
+ 
+-            /* If the EOF bit was set, the real controller doesn't stop the transfer, it simply
+-             * sets the status accordingly (and generates an interrupt if enabled) */
+-            if (eof_bit) {
+-                esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_EOF_MASK |
+-                                                       R_GDMA_INTERRUPT_OUT_TOTAL_EOF_MASK);
+-            }
++            /* If the EOF bit was set, the real controller doesn't stop the
++             * transfer; the status was raised above before following the
++             * linked-list pointer. */
+         }
+     }
+ 
+@@ -400,12 +517,79 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
+     return !error;
+ }
+ 
++bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer,
++                           uint32_t size)
++{
++    DmaConfigState *state = &s->ch_conf[ESP_GDMA_OUT_IDX][chan];
++    uint32_t addr = ((ESP_GDMA_RAM_ADDR >> 20) << 20) |
++                    FIELD_EX32(state->link, GDMA_OUT_LINK, ADDR);
++    return esp_gdma_read_channel_at(s, chan, buffer, size, addr);
++}
++
++static bool esp_gdma_stream_descriptor_addr(const DmaConfigState *state,
++                                            uint32_t dir, uint32_t *addr)
++{
++    const bool restarted = dir == ESP_GDMA_OUT_IDX
++        ? (FIELD_EX32(state->link, GDMA_OUT_LINK, START) ||
++           FIELD_EX32(state->link, GDMA_OUT_LINK, RESTART))
++        : (FIELD_EX32(state->link, GDMA_IN_LINK, START) ||
++           FIELD_EX32(state->link, GDMA_IN_LINK, RESTART));
++
++    /* A non-zero desc_addr is the hardware cursor for the next descriptor.
++     * A START/RESTART command explicitly selects the link register again.
++     * If a non-started stream has already reached a zero next pointer, do not
++     * silently jump back to the first descriptor and replay it forever. */
++    if (!restarted && state->desc_addr != 0) {
++        *addr = state->desc_addr;
++        return true;
++    }
++    if (!restarted && state->state != 0) {
++        return false;
++    }
++
++    *addr = ((ESP_GDMA_RAM_ADDR >> 20) << 20) |
++            (dir == ESP_GDMA_OUT_IDX
++             ? FIELD_EX32(state->link, GDMA_OUT_LINK, ADDR)
++             : FIELD_EX32(state->link, GDMA_IN_LINK, ADDR));
++    return *addr != 0;
++}
++
++bool esp_gdma_read_channel_one(ESPGdmaState *s, uint32_t chan, uint8_t* buffer,
++                               uint32_t size, uint32_t *transferred)
++{
++    DmaConfigState *state = &s->ch_conf[ESP_GDMA_OUT_IDX][chan];
++    uint32_t addr;
++    GdmaLinkedList descriptor;
++
++    if (transferred) {
++        *transferred = 0;
++    }
++
++    if (!esp_gdma_stream_descriptor_addr(state, ESP_GDMA_OUT_IDX, &addr) ||
++        !esp_gdma_read_descr(s, addr, &descriptor) ||
++        descriptor.config.length == 0 || descriptor.config.length > size) {
++        return false;
++    }
++
++    /* Passing the exact descriptor length makes the existing transfer path
++     * stop after this node.  It still performs normal owner checks, descriptor
++     * write-back, EOF/DONE status generation, and guest-memory copying. */
++    const uint32_t length = descriptor.config.length;
++    const bool ok = esp_gdma_read_channel_at(s, chan, buffer, length, addr);
++    if (ok && transferred) {
++        *transferred = length;
++    }
++    return ok;
++}
++
+ 
+ /**
+  * @brief Write data to the guest RAM pointed by the linked list configured in the given DmaConfigState index.
+  *        `size` bytes from `buffer` will be written to guest machine's RAM.
+  */
+-bool esp_gdma_write_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint32_t size)
++static bool esp_gdma_write_channel_at(ESPGdmaState *s, uint32_t chan,
++                                      uint8_t* buffer, uint32_t size,
++                                      uint32_t first_addr)
+ {
+     DmaConfigState* state = &s->ch_conf[ESP_GDMA_IN_IDX][chan];
+ 
+@@ -416,8 +600,9 @@ bool esp_gdma_write_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uin
+     esp_gdma_clear_status(&state->int_state, R_GDMA_INTERRUPT_IN_DONE_MASK  |
+                                              R_GDMA_INTERRUPT_IN_SUC_EOF_MASK);
+ 
+-    /* Get highest 12 bits of the DRAM address */
+-    uint32_t in_addr = ((ESP_GDMA_RAM_ADDR >> 20) << 20) | FIELD_EX32(state->link, GDMA_IN_LINK, ADDR);
++    /* Use the caller-selected descriptor cursor so streaming IN transfers
++     * continue through the ring after the first completion. */
++    uint32_t in_addr = first_addr;
+ 
+     /* Boolean to mark whether we need to check the owner for in buffers */
+     const bool owner_check_in = FIELD_EX32(state->conf1, GDMA_IN_CONF1, CHECK_OWNER);
+@@ -430,6 +615,12 @@ bool esp_gdma_write_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uin
+     valid = esp_gdma_read_descr(s, in_addr, &in_list);
+     esp_gdma_push_descriptor(s, chan, ESP_GDMA_IN_IDX, in_addr);
+ 
++    const bool is_i2s = FIELD_EX32(state->peripheral, GDMA_PERI_SEL, PERI_SEL) == GDMA_I2S0;
++    if (is_i2s) {
++        esp_gdma_i2s_trace("RX_DESC", ESP_GDMA_IN_IDX, chan, in_addr,
++                           &in_list, buffer, 0, valid);
++    }
++
+     if ( !valid || (owner_check_in && !in_list.config.owner) ) {
+         esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_IN_DSCR_ERR_MASK);
+         return false;
+@@ -460,6 +651,11 @@ bool esp_gdma_write_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uin
+         in_list.config.length += min;
+         consumed += min;
+ 
++        if (is_i2s) {
++            esp_gdma_i2s_trace("RX_DATA", ESP_GDMA_IN_IDX, chan, in_addr,
++                               &in_list, buffer + consumed - min, min, valid);
++        }
++
+         if (size == consumed) {
+             exit_loop = true;
+         }
+@@ -525,9 +721,43 @@ bool esp_gdma_write_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uin
+         esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_IN_DONE_MASK);
+     }
+ 
++    if (is_i2s) {
++        esp_gdma_i2s_trace("RX_END", ESP_GDMA_IN_IDX, chan, in_addr,
++                           &in_list, NULL, consumed, !error);
++    }
++
+     return !error;
+ }
+ 
++bool esp_gdma_write_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer,
++                            uint32_t size)
++{
++    DmaConfigState *state = &s->ch_conf[ESP_GDMA_IN_IDX][chan];
++    uint32_t addr = ((ESP_GDMA_RAM_ADDR >> 20) << 20) |
++                    FIELD_EX32(state->link, GDMA_IN_LINK, ADDR);
++    return esp_gdma_write_channel_at(s, chan, buffer, size, addr);
++}
++
++bool esp_gdma_write_channel_one(ESPGdmaState *s, uint32_t chan, uint8_t* buffer,
++                                uint32_t size)
++{
++    DmaConfigState *state = &s->ch_conf[ESP_GDMA_IN_IDX][chan];
++    uint32_t addr;
++    GdmaLinkedList descriptor;
++
++    if (!esp_gdma_stream_descriptor_addr(state, ESP_GDMA_IN_IDX, &addr) ||
++        !esp_gdma_read_descr(s, addr, &descriptor) ||
++        descriptor.config.size == 0 || descriptor.config.size > size) {
++        return false;
++    }
++
++    /* Passing the exact descriptor size prevents a synthetic RX completion
++     * from consuming the following nodes in the ring.  The firmware's ISR
++     * uses the resulting EOF descriptor to recycle exactly this node. */
++    return esp_gdma_write_channel_at(s, chan, buffer, descriptor.config.size,
++                                     addr);
++}
++
+ 
+ /**
+  * @brief Check if a memory-to-memory transfer can be started and start it if possible
+@@ -841,6 +1071,7 @@ void esp_gdma_write_chan_register(ESPGdmaState* s, uint32_t dir, uint32_t chan,
+ {
+     ESPGdmaClass *class = ESP_GDMA_GET_CLASS(s);
+     assert(s != NULL && chan < class->m_channel_count && dir < ESP_GDMA_CONF_COUNT);
++    esp_gdma_trace("W", dir, chan, reg, value);
+ 
+     switch (reg) {
+         /* Interrupt related */
+diff --git a/hw/gpio/esp32_gpio.c b/hw/gpio/esp32_gpio.c
+index 4fea1f5..ff5967d 100644
+--- a/hw/gpio/esp32_gpio.c
++++ b/hw/gpio/esp32_gpio.c
+@@ -19,6 +19,29 @@
+ #include "hw/qdev-properties.h"
+ #include "hw/gpio/esp32_gpio.h"
+ 
++#define ESP32_GPIO_TRACE_LIMIT 128
++static unsigned esp32_gpio_trace_count;
++
++static void esp32_gpio_trace(uint32_t value)
++{
++    if (esp32_gpio_trace_count >= ESP32_GPIO_TRACE_LIMIT) {
++        return;
++    }
++    vaddr pc = current_cpu && current_cpu->cc->get_pc
++        ? current_cpu->cc->get_pc(current_cpu) : 0;
++    fprintf(stderr,
++            "[ESP32 GPIO TRACE] pc=0x%08llx gpio_out=0x%08x gpio20=%u\\n",
++            (unsigned long long)pc, value, (value >> 20) & 1u);
++    esp32_gpio_trace_count++;
++}
++
++static void esp32_gpio_update_outputs(Esp32GpioState *s)
++{
++    esp32_gpio_trace(s->gpio_out);
++    for (int pin = 0; pin < ESP32_GPIO_PIN_COUNT; ++pin) {
++        qemu_set_irq(s->gpio_out_lines[pin], (s->gpio_out >> pin) & 1);
++    }
++}
+ 
+ 
+ static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
+@@ -26,6 +49,15 @@ static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
+     Esp32GpioState *s = ESP32_GPIO(opaque);
+     uint64_t r = 0;
+     switch (addr) {
++    case ESP32_GPIO_OUT_REG:
++        r = s->gpio_out;
++        break;
++    case ESP32_GPIO_ENABLE_REG:
++        r = s->gpio_enable;
++        break;
++    case ESP32_GPIO_IN_REG:
++        r = s->gpio_in;
++        break;
+     case A_GPIO_STRAP:
+         r = s->strap_mode;
+         break;
+@@ -39,6 +71,35 @@ static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
+ static void esp32_gpio_write(void *opaque, hwaddr addr,
+                        uint64_t value, unsigned int size)
+ {
++    Esp32GpioState *s = ESP32_GPIO(opaque);
++    const uint32_t mask = (1u << ESP32_GPIO_PIN_COUNT) - 1u;
++    const uint32_t wvalue = value & mask;
++
++    switch (addr) {
++    case ESP32_GPIO_OUT_REG:
++        s->gpio_out = wvalue;
++        esp32_gpio_update_outputs(s);
++        break;
++    case ESP32_GPIO_OUT_W1TS_REG:
++        s->gpio_out |= wvalue;
++        esp32_gpio_update_outputs(s);
++        break;
++    case ESP32_GPIO_OUT_W1TC_REG:
++        s->gpio_out &= ~wvalue;
++        esp32_gpio_update_outputs(s);
++        break;
++    case ESP32_GPIO_ENABLE_REG:
++        s->gpio_enable = wvalue;
++        break;
++    case ESP32_GPIO_ENABLE_W1TS_REG:
++        s->gpio_enable |= wvalue;
++        break;
++    case ESP32_GPIO_ENABLE_W1TC_REG:
++        s->gpio_enable &= ~wvalue;
++        break;
++    default:
++        break;
++    }
+ }
+ 
+ static const MemoryRegionOps uart_ops = {
+@@ -49,6 +110,12 @@ static const MemoryRegionOps uart_ops = {
+ 
+ static void esp32_gpio_reset_hold(Object *obj, ResetType type)
+ {
++    Esp32GpioState *s = ESP32_GPIO(obj);
++
++    s->gpio_out = 0;
++    s->gpio_enable = 0;
++    s->gpio_in = 0;
++    esp32_gpio_update_outputs(s);
+ }
+ 
+ static void esp32_gpio_realize(DeviceState *dev, Error **errp)
+@@ -67,6 +134,7 @@ static void esp32_gpio_init(Object *obj)
+                           TYPE_ESP32_GPIO, 0x1000);
+     sysbus_init_mmio(sbd, &s->iomem);
+     sysbus_init_irq(sbd, &s->irq);
++    qdev_init_gpio_out(DEVICE(s), s->gpio_out_lines, ESP32_GPIO_PIN_COUNT);
+ }
+ 
+ static Property esp32_gpio_properties[] = {
+diff --git a/hw/gpio/esp32c3_gpio.c b/hw/gpio/esp32c3_gpio.c
+index 1e84238..8294cef 100644
+--- a/hw/gpio/esp32c3_gpio.c
++++ b/hw/gpio/esp32c3_gpio.c
+@@ -26,10 +26,29 @@ static void esp32c3_gpio_init(Object *obj)
+     object_property_set_int(obj, "strap_mode", ESP32C3_STRAP_MODE_FLASH_BOOT, &error_fatal);
+ }
+ 
++static void esp32c3_gpio_reset_hold(Object *obj, ResetType type)
++{
++    ESP32C3GPIOClass *c = ESP32C3_GPIO_GET_CLASS(obj);
++    Esp32GpioState *s = ESP32_GPIO(obj);
++
++    if (c->parent_phases.hold) {
++        c->parent_phases.hold(obj, type);
++    }
++
++    /* GPIO0 is the board's active-low ADC button ladder.  With no key
++     * pressed, its external pull-up leaves the digital input high. */
++    s->gpio_in |= BIT(0);
++}
++
+ /* If we need to override any function from the parent (reset, realize, ...), it shall be done
+  * in this class_init function */
+ static void esp32c3_gpio_class_init(ObjectClass *klass, void *data)
+ {
++    ResettableClass *rc = RESETTABLE_CLASS(klass);
++    ESP32C3GPIOClass *c = ESP32C3_GPIO_CLASS(klass);
++
++    resettable_class_set_parent_phases(rc, NULL, esp32c3_gpio_reset_hold,
++                                       NULL, &c->parent_phases);
+ }
+ 
+ static const TypeInfo esp32c3_gpio_info = {
+diff --git a/hw/i2c/esp32_i2c.c b/hw/i2c/esp32_i2c.c
+index 5f4022f..0a7d08b 100644
+--- a/hw/i2c/esp32_i2c.c
++++ b/hw/i2c/esp32_i2c.c
+@@ -5,6 +5,26 @@
+ #include "hw/i2c/esp32_i2c.h"
+ #include "hw/irq.h"
+ 
++#define ESP32_I2C_TRACE_LIMIT 0
++static unsigned esp32_i2c_trace_count;
++
++static void esp32_i2c_trace(const char *op, Esp32I2CState *s,
++                            hwaddr addr, uint64_t value)
++{
++    if (esp32_i2c_trace_count >= ESP32_I2C_TRACE_LIMIT) {
++        return;
++    }
++    vaddr pc = current_cpu && current_cpu->cc->get_pc
++        ? current_cpu->cc->get_pc(current_cpu) : 0;
++    fprintf(stderr,
++            "[ESP32-I2C TRACE] %s pc=0x%08llx off=0x%03llx value=0x%08llx tx=%u rx=%u busy=%d\\n",
++            op, (unsigned long long)pc, (unsigned long long)addr,
++            (unsigned long long)value,
++            fifo8_num_used(&s->tx_fifo), fifo8_num_used(&s->rx_fifo),
++            s->trans_ongoing);
++    esp32_i2c_trace_count++;
++}
++
+ static void esp32_i2c_do_transaction(Esp32I2CState * s);
+ static void esp32_i2c_update_irq(Esp32I2CState * s);
+ 
+@@ -51,55 +71,78 @@ static void esp32_i2c_update_irq(Esp32I2CState * s)
+ static uint64_t esp32_i2c_read(void * opaque, hwaddr addr, unsigned int size)
+ {
+     Esp32I2CState * s = Esp32_I2C(opaque);
++    uint64_t result = 0;
+ 
+     switch(addr) {
+     case A_I2C_CTR:
+-        return s->ctr_reg;
++        result = s->ctr_reg;
++        break;
+     case A_I2C_STATUS:
+-        return esp32_i2c_get_status_reg(s);
++        result = esp32_i2c_get_status_reg(s);
++        break;
+     case A_I2C_FIFO_DATA: {
+         if (fifo8_num_used(&s->rx_fifo) == 0) {
+             error_report("esp32_i2c: read I2C FIFO while it is empty");
+-            return 0xee;
++            result = 0xee;
++            break;
+         }
+         uint8_t res = fifo8_pop(&s->rx_fifo);
+-        return res;
++        result = res;
++        break;
+     }
+     case A_I2C_INT_RAW:
+-        return s->int_raw_reg;
++        result = s->int_raw_reg;
++        break;
+     case A_I2C_INT_ENA:
+-        return s->int_ena_reg;
++        result = s->int_ena_reg;
++        break;
+     case A_I2C_INT_ST:
+-        return s->int_raw_reg & s->int_ena_reg;
++        result = s->int_raw_reg & s->int_ena_reg;
++        break;
+     case A_I2C_CMD ... (A_I2C_CMD + ESP32_I2C_CMD_COUNT * 4):
+-        return s->cmd_reg[(addr - A_I2C_CMD) / 4];
++        result = s->cmd_reg[(addr - A_I2C_CMD) / 4];
++        break;
+     case A_I2C_TIMEOUT:
+-        return s->timeout_reg;
++        result = s->timeout_reg;
++        break;
+     case A_I2C_SDA_HOLD:
+-        return s->sda_hold_reg;
++        result = s->sda_hold_reg;
++        break;
+     case A_I2C_SDA_SAMPLE:
+-        return s->sda_sample_reg;
++        result = s->sda_sample_reg;
++        break;
+     case A_I2C_HIGH_PERIOD:
+-        return s->high_period_reg;
++        result = s->high_period_reg;
++        break;
+     case A_I2C_LOW_PERIOD:
+-        return s->low_period_reg;
++        result = s->low_period_reg;
++        break;
+     case A_I2C_START_HOLD:
+-        return s->start_hold_reg;
++        result = s->start_hold_reg;
++        break;
+     case A_I2C_RSTART_SETUP:
+-        return s->rstart_setup_reg;
++        result = s->rstart_setup_reg;
++        break;
+     case A_I2C_STOP_HOLD:
+-        return s->stop_hold_reg;
++        result = s->stop_hold_reg;
++        break;
+     case A_I2C_STOP_SETUP:
+-        return s->stop_setup_reg;
++        result = s->stop_setup_reg;
++        break;
+     default:
+-        return 0;
++        result = 0;
++        break;
+     }
++    esp32_i2c_trace("R", s, addr, result);
++    return result;
+ }
+ 
+ static void esp32_i2c_write(void * opaque, hwaddr addr, uint64_t value, unsigned int size)
+ {
+     Esp32I2CState * s = Esp32_I2C(opaque);
+ 
++    esp32_i2c_trace("W", s, addr, value);
++
+     switch(addr) {
+     case A_I2C_CTR:
+         if (FIELD_EX32(value, I2C_CTR, MS_MODE) != 1) {
+@@ -174,10 +217,12 @@ static void esp32_i2c_write(void * opaque, hwaddr addr, uint64_t value, unsigned
+ 
+ static void esp32_i2c_do_transaction(Esp32I2CState * s)
+ {
++    esp32_i2c_trace("START", s, 0xffffffffu, s->ctr_reg);
+     bool stop_or_end = false;
+     for (int i_cmd = 0; i_cmd < ESP32_I2C_CMD_COUNT && !stop_or_end; ++i_cmd) {
+         uint32_t cmd = s->cmd_reg[i_cmd];
+         char opcode = FIELD_EX32(cmd, I2C_CMD, OPCODE);
++        esp32_i2c_trace("CMD", s, i_cmd, cmd);
+         switch (opcode) {
+             case I2C_OPCODE_RSTART:
+                 i2c_end_transfer(s->bus);
+diff --git a/hw/i2c/esp32_i2c_devices.c b/hw/i2c/esp32_i2c_devices.c
+new file mode 100644
+index 0000000..eac2d73
+--- /dev/null
++++ b/hw/i2c/esp32_i2c_devices.c
+@@ -0,0 +1,111 @@
++#include "qemu/osdep.h"
++#include "qemu/module.h"
++#include "hw/i2c/esp32_i2c_devices.h"
++
++/* Keep the codec trace bounded: it is intended to capture one boot/audio
++ * transaction, not to turn every I2C byte into an unbounded QEMU log. */
++#define ESP32_I2C_DEVICE_TRACE_LIMIT 2000
++static unsigned esp32_i2c_device_trace_count;
++
++static void esp32_i2c_device_trace(Esp32I2CPeripheral *s, const char *op,
++                                   uint8_t value)
++{
++    if (esp32_i2c_device_trace_count >= ESP32_I2C_DEVICE_TRACE_LIMIT) {
++        return;
++    }
++    fprintf(stderr,
++            "[ESP32-I2C DEV] addr=0x%02x %s reg=0x%02x value=0x%02x expect=%d\n",
++            s->parent_obj.address, op,
++            s->register_pointer, value, s->expect_register);
++    esp32_i2c_device_trace_count++;
++}
++
++static int esp32_i2c_peripheral_send(I2CSlave *dev, uint8_t data)
++{
++    Esp32I2CPeripheral *s = ESP32_I2C_PERIPHERAL(dev);
++
++    esp32_i2c_device_trace(s, "W", data);
++    if (s->expect_register) {
++        s->register_pointer = data;
++        s->expect_register = false;
++    } else {
++        s->registers[s->register_pointer++] = data;
++    }
++    return 0;
++}
++
++static uint8_t esp32_i2c_peripheral_recv(I2CSlave *dev)
++{
++    Esp32I2CPeripheral *s = ESP32_I2C_PERIPHERAL(dev);
++
++    esp32_i2c_device_trace(s, "R", s->registers[s->register_pointer]);
++    return s->registers[s->register_pointer++];
++}
++
++static int esp32_i2c_peripheral_event(I2CSlave *dev, enum i2c_event event)
++{
++    Esp32I2CPeripheral *s = ESP32_I2C_PERIPHERAL(dev);
++
++    if (event == I2C_START_SEND) {
++        if (esp32_i2c_device_trace_count < ESP32_I2C_DEVICE_TRACE_LIMIT) {
++            fprintf(stderr,
++                    "[ESP32-I2C DEV] addr=0x%02x START_SEND\n",
++                    s->parent_obj.address);
++            esp32_i2c_device_trace_count++;
++        }
++        s->expect_register = true;
++    }
++    return 0;
++}
++
++static void esp32_i2c_peripheral_realize(DeviceState *dev, Error **errp)
++{
++    Esp32I2CPeripheral *s = ESP32_I2C_PERIPHERAL(dev);
++
++    memset(s->registers, 0, sizeof(s->registers));
++    s->register_pointer = 0;
++    s->expect_register = true;
++
++    if (s->parent_obj.address == 0x63) {
++        /* CW2017: a stable, healthy battery is enough for the firmware to
++         * complete its optional battery initialization path. */
++        s->registers[0x00] = 0x01;
++        s->registers[0x02] = 0x2b;
++        s->registers[0x03] = 0x00;
++        s->registers[0x04] = 0x64;
++        s->registers[0x05] = 0x00;
++        s->registers[0x08] = 0x00;
++    } else if (s->parent_obj.address == 0x18) {
++        /* ES8311 identity/reset locations.  Other control registers retain
++         * their reset value and accept writes, which is sufficient for the
++         * codec driver to initialize without a physical codec. */
++        s->registers[0xfd] = 0x83;
++        s->registers[0xfe] = 0x12;
++        s->registers[0xff] = 0x10;
++    }
++}
++
++static void esp32_i2c_peripheral_class_init(ObjectClass *klass, void *data)
++{
++    I2CSlaveClass *sc = I2C_SLAVE_CLASS(klass);
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = esp32_i2c_peripheral_realize;
++    sc->send = esp32_i2c_peripheral_send;
++    sc->recv = esp32_i2c_peripheral_recv;
++    sc->event = esp32_i2c_peripheral_event;
++}
++
++static const TypeInfo esp32_i2c_peripheral_info = {
++    .name = TYPE_ESP32_I2C_PERIPHERAL,
++    .parent = TYPE_I2C_SLAVE,
++    .instance_size = sizeof(Esp32I2CPeripheral),
++    .class_init = esp32_i2c_peripheral_class_init,
++};
++
++static void esp32_i2c_peripheral_register_types(void)
++{
++    type_register_static(&esp32_i2c_peripheral_info);
++}
++
++type_init(esp32_i2c_peripheral_register_types)
+diff --git a/hw/i2c/meson.build b/hw/i2c/meson.build
+index e72dca0..3a53a8c 100644
+--- a/hw/i2c/meson.build
++++ b/hw/i2c/meson.build
+@@ -17,6 +17,7 @@ i2c_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_i2c.c'))
+ i2c_ss.add(when: 'CONFIG_PPC4XX', if_true: files('ppc4xx_i2c.c'))
+ i2c_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files('esp32_i2c.c'))
+ i2c_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32_i2c.c'))
++i2c_ss.add(when: 'CONFIG_RISCV_ESP32C3', if_true: files('esp32_i2c.c', 'esp32_i2c_devices.c'))
+ i2c_ss.add(when: 'CONFIG_PCA954X', if_true: files('i2c_mux_pca954x.c'))
+ i2c_ss.add(when: 'CONFIG_PMBUS', if_true: files('pmbus_device.c'))
+ i2c_ss.add(when: 'CONFIG_BCM2835_I2C', if_true: files('bcm2835_i2c.c'))
+diff --git a/hw/misc/esp32c3_cache.c b/hw/misc/esp32c3_cache.c
+index 1879b5c..5e1633d 100644
+--- a/hw/misc/esp32c3_cache.c
++++ b/hw/misc/esp32c3_cache.c
+@@ -27,6 +27,8 @@
+ 
+ #define CACHE_DEBUG      0
+ #define CACHE_WARNING    0
++#define CACHE_TRACE_LIMIT 400
++static unsigned esp32c3_cache_trace_count;
+ 
+ 
+ /**
+@@ -80,7 +82,15 @@ static inline void esp32c3_write_mmu_value(ESP32C3CacheState *s, hwaddr reg_addr
+             }
+         } else {
+             if (s->flash_blk != NULL) {
+-                blk_pread(s->flash_blk, physical_address, ESP32C3_PAGE_SIZE, cache_data, 0);
++                int ret = blk_pread(s->flash_blk, physical_address, ESP32C3_PAGE_SIZE, cache_data, 0);
++                if (esp32c3_cache_trace_count < CACHE_TRACE_LIMIT) {
++                    fprintf(stderr,
++                            "[ESP32-C3 CACHE TRACE] mmu_index=%u page=0x%02x physical=0x%08x ret=%d first=%02x%02x%02x%02x\\n",
++                            (unsigned)index, (unsigned)e.page_number,
++                            (unsigned)physical_address, ret,
++                            cache_data[0], cache_data[1], cache_data[2], cache_data[3]);
++                    esp32c3_cache_trace_count++;
++                }
+             }
+             if (xts_aes_class->is_flash_enc_enabled(s->xts_aes)) {
+                 xts_aes_class->decrypt(s->xts_aes, physical_address, cache_data, ESP32C3_PAGE_SIZE);
+diff --git a/hw/misc/esp32c3_jtag.c b/hw/misc/esp32c3_jtag.c
+index 82ee697..6cc5157 100644
+--- a/hw/misc/esp32c3_jtag.c
++++ b/hw/misc/esp32c3_jtag.c
+@@ -11,22 +11,123 @@
+ #include "qemu/log.h"
+ #include "qemu/module.h"
+ #include "qemu/error-report.h"
++#include <stdio.h>
+ #include "hw/hw.h"
+ #include "hw/sysbus.h"
+ #include "hw/misc/esp32c3_jtag.h"
+ 
+ 
++static void esp32c3_jtag_flush_tx(ESP32C3UsbJtagState *s)
++{
++    if (s->tx_fifo_len == 0) {
++        return;
++    }
++
++    fwrite(s->tx_fifo, 1, s->tx_fifo_len, stdout);
++    fflush(stdout);
++    s->tx_fifo_len = 0;
++    s->int_raw |= ESP32C3_JTAG_INTR_SERIAL_IN_EMPTY;
++}
++
++
+ static uint64_t esp32c3_jtag_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+     ESP32C3UsbJtagState *s = ESP32C3_JTAG(opaque);
+-    (void) s;
+-    return 0;
++
++    switch (addr) {
++    case ESP32C3_JTAG_EP1_REG:
++        if (s->rx_data_available) {
++            s->rx_data_available = false;
++            return s->rx_byte;
++        }
++        return 0;
++    case ESP32C3_JTAG_EP1_CONF_REG: {
++        uint32_t value = 0;
++        if (s->tx_fifo_len < sizeof(s->tx_fifo)) {
++            value |= ESP32C3_JTAG_SERIAL_IN_DATA_FREE;
++        }
++        if (s->rx_data_available) {
++            value |= ESP32C3_JTAG_SERIAL_OUT_DATA_AVAIL;
++        }
++        return value;
++    }
++    case ESP32C3_JTAG_INT_RAW_REG:
++        return s->int_raw;
++    case ESP32C3_JTAG_INT_ST_REG:
++        return s->int_raw & s->int_ena;
++    case ESP32C3_JTAG_INT_ENA_REG:
++        return s->int_ena;
++    case ESP32C3_JTAG_CONF0_REG:
++        return s->conf0;
++    case ESP32C3_JTAG_TEST_REG:
++        return s->test;
++    case ESP32C3_JTAG_JFIFO_ST_REG: {
++        uint32_t value = s->jfifo_st;
++        if (s->tx_fifo_len == 0) {
++            value |= BIT(2);
++        } else {
++            value &= ~BIT(2);
++        }
++        if (s->tx_fifo_len >= sizeof(s->tx_fifo)) {
++            value |= BIT(3);
++        } else {
++            value &= ~BIT(3);
++        }
++        if (!s->rx_data_available) {
++            value |= BIT(6);
++        } else {
++            value &= ~BIT(6);
++        }
++        return value;
++    }
++    case ESP32C3_JTAG_MISC_CONF_REG:
++        return s->misc_conf;
++    case ESP32C3_JTAG_MEM_CONF_REG:
++        return s->mem_conf;
++    default:
++        return 0;
++    }
+ }
+ 
+ static void esp32c3_jtag_write(void *opaque, hwaddr addr, uint64_t value, unsigned int size)
+ {
+     ESP32C3UsbJtagState *s = ESP32C3_JTAG(opaque);
+-    (void) s;
++
++    switch (addr) {
++    case ESP32C3_JTAG_EP1_REG:
++        if (s->tx_fifo_len < sizeof(s->tx_fifo)) {
++            s->tx_fifo[s->tx_fifo_len++] = value & ESP32C3_JTAG_RDWR_BYTE_MASK;
++            if (s->tx_fifo_len == sizeof(s->tx_fifo)) {
++                esp32c3_jtag_flush_tx(s);
++            }
++        }
++        break;
++    case ESP32C3_JTAG_EP1_CONF_REG:
++        if (value & ESP32C3_JTAG_WR_DONE) {
++            esp32c3_jtag_flush_tx(s);
++        }
++        break;
++    case ESP32C3_JTAG_INT_ENA_REG:
++        s->int_ena = value;
++        break;
++    case ESP32C3_JTAG_INT_CLR_REG:
++        s->int_raw &= ~value;
++        break;
++    case ESP32C3_JTAG_CONF0_REG:
++        s->conf0 = value;
++        break;
++    case ESP32C3_JTAG_TEST_REG:
++        s->test = value;
++        break;
++    case ESP32C3_JTAG_MISC_CONF_REG:
++        s->misc_conf = value;
++        break;
++    case ESP32C3_JTAG_MEM_CONF_REG:
++        s->mem_conf = value;
++        break;
++    default:
++        break;
++    }
+ }
+ 
+ static const MemoryRegionOps esp32c3_jtag_ops = {
+@@ -37,7 +138,17 @@ static const MemoryRegionOps esp32c3_jtag_ops = {
+ 
+ static void esp32c3_jtag_reset_hold(Object *obj, ResetType type)
+ {
+-    (void) obj;
++    ESP32C3UsbJtagState *s = ESP32C3_JTAG(obj);
++    s->int_raw = ESP32C3_JTAG_INTR_SERIAL_IN_EMPTY;
++    s->int_ena = 0;
++    s->conf0 = 0;
++    s->test = 0;
++    s->jfifo_st = 0;
++    s->misc_conf = 0;
++    s->mem_conf = 0;
++    s->tx_fifo_len = 0;
++    s->rx_byte = 0;
++    s->rx_data_available = false;
+     (void) type;
+ }
+ 
+diff --git a/hw/riscv/esp32c3.c b/hw/riscv/esp32c3.c
+index ed698fb..1d4490c 100644
+--- a/hw/riscv/esp32c3.c
++++ b/hw/riscv/esp32c3.c
+@@ -8,8 +8,11 @@
+  * (at your option) any later version.
+  */
+ #include "qemu/osdep.h"
++#include "qemu/atomic.h"
+ #include "qemu/log.h"
+ #include "qemu/error-report.h"
++#include "qemu/main-loop.h"
++#include "qemu/timer.h"
+ #include "hw/qdev-properties.h"
+ #include "qemu/units.h"
+ #include "qemu/datadir.h"
+@@ -40,6 +43,8 @@
+ #include "hw/timer/esp32c3_timg.h"
+ #include "hw/timer/esp32c3_systimer.h"
+ #include "hw/ssi/esp32c3_spi.h"
++#include "hw/i2c/esp32_i2c.h"
++#include "hw/i2c/esp32_i2c_devices.h"
+ #include "hw/misc/esp32c3_rtc_cntl.h"
+ #include "hw/misc/esp32c3_aes.h"
+ #include "hw/misc/esp32c3_rsa.h"
+@@ -49,9 +54,22 @@
+ #include "hw/misc/esp32c3_jtag.h"
+ #include "hw/dma/esp32c3_gdma.h"
+ #include "hw/display/esp_rgb.h"
++#include "hw/display/st7789.h"
+ #include "hw/net/can/esp32c3_twai.h"
+ 
++#include <errno.h>
++#include <unistd.h>
++
+ #define ESP32C3_IO_WARNING          0
++#define ESP32C3_IO_TRACE_LIMIT      0
++#define ESP32C3_RTC_TRACE_LIMIT     0
++#define ESP32C3_I2C_TRACE_LIMIT     0
++#define ESP32C3_BLE_TRACE_LIMIT     0
++#define ESP32C3_ADC_TRACE_LIMIT     2000
++#define ESP32C3_I2S_TRACE_LIMIT     512
++#define ESP32C3_BLE_REG_START       0x60030000
++#define ESP32C3_BLE_REG_END         0x60033000
++#define ESP32C3_BLE_REG_COUNT       ((ESP32C3_BLE_REG_END - ESP32C3_BLE_REG_START) / sizeof(uint32_t))
+ 
+ #define ESP32C3_RESET_ADDRESS       0x40000000
+ #define ESP32C3_RESET_GPIO_NAME     "esp32c3.machine.reset_gpio"
+@@ -86,6 +104,8 @@ struct Esp32C3MachineState {
+     ESP32C3TimgState timg[2];
+     ESP32C3SysTimerState systimer;
+     ESP32C3SpiState spi1;
++    ESP32C3SpiState spi2;
++    Esp32I2CState i2c0;
+     ESP32C3RtcCntlState rtccntl;
+     ESP32C3UsbJtagState jtag;
+     ESPRgbState rgb;
+@@ -100,6 +120,520 @@ struct Esp32C3MachineState {
+ /* Temporary macro to mark the CPU as in non-debugging mode */
+ #define A_ASSIST_DEBUG_CORE_0_DEBUG_MODE_REG    0x098
+ 
++/* Minimal state for the legacy SYSCON modem clock window at 0x60026000. */
++static uint32_t esp32c3_syscon_wifi_clk_en;
++static uint32_t esp32c3_syscon_wifi_rst_en;
++/*
++ * The ESP-IDF button ladder uses the APB SARADC block during BSP startup.
++ * QEMU does not have a native C3 SARADC device, but returning zero for the
++ * whole register window is worse than a small explicit model: the IDF
++ * driver interprets the zero-valued control/status registers as a peripheral
++ * that never completes and keeps polling until the interrupt watchdog fires.
++ * Keep the model deliberately small and deterministic.  It exposes a
++ * released-button sample and completes one-shot ADC1 conversions
++ * synchronously; all ordinary R/W registers retain the last guest write.
++ */
++#define ESP32C3_SARADC_REG_COUNT (0x400 / sizeof(uint32_t))
++static uint32_t esp32c3_saradc_regs[ESP32C3_SARADC_REG_COUNT];
++static uint32_t esp32c3_saradc_raw = 0x0fff;
++static uint32_t esp32c3_button_last_raw = 0x0fff;
++static ESP32C3GPIOState *esp32c3_gpio_state;
++static QEMUTimer *esp32c3_button_release_timer;
++static QEMUTimer *esp32c3_button_second_press_timer;
++static unsigned esp32c3_saradc_trace_count;
++
++static void esp32c3_saradc_trace(const char *op, hwaddr offset,
++                                 uint32_t value)
++{
++    /* Conversion setup is polled continuously by the IDF button task.  Only
++     * trace result/status reads so a host button can still be diagnosed after
++     * the guest has been running for a while. */
++    if (op[0] != 'R') {
++        return;
++    }
++    if (offset != 0x02c && offset != 0x044 && offset != 0x048) {
++        return;
++    }
++    /* Keep the diagnostic focused on the active input state.  A released
++     * button can produce thousands of successful one-shot conversions before
++     * a host command arrives, which used to hide the only read that matters. */
++    uint32_t raw = qatomic_read(&esp32c3_saradc_raw);
++    if (raw == 0x0fff && offset != 0x020 && offset != 0x04c) {
++        return;
++    }
++    if (esp32c3_saradc_trace_count >= ESP32C3_ADC_TRACE_LIMIT) {
++        return;
++    }
++    vaddr pc = current_cpu && current_cpu->cc->get_pc
++        ? current_cpu->cc->get_pc(current_cpu) : 0;
++    fprintf(stderr,
++            "[ESP32-C3 ADC TRACE] %s off=0x%03llx value=0x%08x raw=0x%03x pc=0x%08llx\n",
++            op,
++            (unsigned long long)offset,
++            value,
++            raw,
++            (unsigned long long)pc);
++    esp32c3_saradc_trace_count++;
++}
++
++static uint32_t esp32c3_button_raw_for_line(const char *line)
++{
++    /* Values are chosen inside the original BSP voltage windows after the
++     * ESP32-C3 ADC calibration step: UP < 150 mV, DOWN 150..447 mV, and
++     * OK 447..1900 mV. */
++    if (strstr(line, "\"button\":\"UP\"") ||
++        strstr(line, "\"button\": \"UP\"")) {
++        return 0x0030;
++    }
++    if (strstr(line, "\"button\":\"DOWN\"") ||
++        strstr(line, "\"button\": \"DOWN\"")) {
++        return 0x0130;
++    }
++    if (strstr(line, "\"button\":\"OK\"") ||
++        strstr(line, "\"button\": \"OK\"")) {
++        return 0x0500;
++    }
++    return 0;
++}
++
++static void esp32c3_button_release(void *opaque)
++{
++    (void)opaque;
++    qatomic_set(&esp32c3_saradc_raw, 0x0fff);
++    if (esp32c3_gpio_state) {
++        esp32c3_gpio_state->parent.gpio_in |= BIT(0);
++    }
++    fprintf(stderr, "[ESP32-C3 INPUT RELEASE] raw=0xfff\\n");
++}
++
++static void esp32c3_button_second_press(void *opaque)
++{
++    (void)opaque;
++    if (qatomic_read(&esp32c3_saradc_raw) == 0x0fff) {
++        qatomic_set(&esp32c3_saradc_raw, esp32c3_button_last_raw);
++        if (esp32c3_gpio_state) {
++            esp32c3_gpio_state->parent.gpio_in &= ~BIT(0);
++        }
++        timer_mod_ns(esp32c3_button_release_timer,
++                     qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 120 * SCALE_MS);
++    }
++}
++
++static void esp32c3_input_apply_line(const char *line)
++{
++    uint32_t raw = esp32c3_button_raw_for_line(line);
++    if (!raw) {
++        return;
++    }
++
++    esp32c3_button_last_raw = raw;
++    qatomic_set(&esp32c3_saradc_raw, raw);
++    if (esp32c3_gpio_state) {
++        esp32c3_gpio_state->parent.gpio_in &= ~BIT(0);
++    }
++    const bool is_long = strstr(line, "\"event\":\"LONG\"") ||
++                         strstr(line, "\"event\": \"LONG\"");
++    const bool is_press = strstr(line, "\"event\":\"PRESS\"") ||
++                          strstr(line, "\"event\": \"PRESS\"");
++    const bool is_double = strstr(line, "\"event\":\"DOUBLE\"") ||
++                           strstr(line, "\"event\": \"DOUBLE\"");
++    int duration_ms = is_long ? 1400 : (is_press ? 80 : 400);
++    timer_mod_ns(esp32c3_button_release_timer,
++                 qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + duration_ms * SCALE_MS);
++    if (is_double) {
++        timer_mod_ns(esp32c3_button_second_press_timer,
++                     qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 260 * SCALE_MS);
++    }
++    fprintf(stderr, "[ESP32-C3 INPUT] %s raw=0x%03x duration_ms=%d\n",
++            line, raw, duration_ms);
++}
++
++static void esp32c3_input_read(void *opaque)
++{
++    static char line[512];
++    static size_t line_len;
++    uint8_t chunk[256];
++    ssize_t size = read(STDIN_FILENO, chunk, sizeof(chunk));
++    if (size <= 0) {
++        if (size == 0 || (errno != EAGAIN && errno != EINTR)) {
++            qemu_set_fd_handler(STDIN_FILENO, NULL, NULL, NULL);
++        }
++        return;
++    }
++
++    for (ssize_t i = 0; i < size; i++) {
++        if (chunk[i] == '\n') {
++            line[line_len] = '\0';
++            esp32c3_input_apply_line(line);
++            line_len = 0;
++        } else if (line_len + 1 < sizeof(line)) {
++            line[line_len++] = (char)chunk[i];
++        } else {
++            line_len = 0;
++        }
++    }
++    (void)opaque;
++}
++
++static uint32_t esp32c3_saradc_read(hwaddr offset)
++{
++    uint32_t value;
++    switch (offset) {
++    case 0x02c: /* APB_SARADC_1_DATA_STATUS_REG */
++        value = qatomic_read(&esp32c3_saradc_raw);
++        break;
++    case 0x030: /* APB_SARADC_2_DATA_STATUS_REG */
++        value = 0;
++        break;
++    case 0x044: /* APB_SARADC_INT_RAW_REG */
++        value = esp32c3_saradc_regs[0x044 >> 2];
++        break;
++    case 0x048: /* APB_SARADC_INT_ST_REG */
++        value = esp32c3_saradc_regs[0x044 >> 2];
++        break;
++    case 0x3fc: /* APB_SARADC_APB_CTRL_DATE_REG */
++        value = 0x02007171;
++        break;
++    default:
++        value = esp32c3_saradc_regs[offset >> 2];
++        break;
++    }
++    esp32c3_saradc_trace("R", offset, value);
++    return value;
++}
++
++static void esp32c3_saradc_write(hwaddr offset, uint32_t value)
++{
++    if (offset == 0x020 || offset == 0x04c || offset == 0x040 ||
++        offset == 0x00c || offset == 0x010 || offset == 0x014) {
++        esp32c3_saradc_trace("W", offset, value);
++    }
++    switch (offset) {
++    case 0x02c: /* read-only conversion result */
++    case 0x030:
++    case 0x044: /* read-only raw interrupt state */
++    case 0x048: /* read-only interrupt state */
++        return;
++    case 0x04c: /* APB_SARADC_INT_CLR_REG, write-one-to-clear */
++        if (value & BIT(31)) {
++            esp32c3_saradc_regs[0x044 >> 2] = 0;
++        }
++        return;
++    case 0x020: /* APB_SARADC_ONETIME_SAMPLE_REG */
++        esp32c3_saradc_regs[offset >> 2] = value;
++        if ((value & BIT(31)) && (value & BIT(29))) {
++            esp32c3_saradc_regs[0x044 >> 2] = BIT(31);
++        }
++        return;
++    default:
++        esp32c3_saradc_regs[offset >> 2] = value;
++        return;
++    }
++}
++static unsigned esp32c3_rtc_i2c_trace_count;
++static unsigned esp32c3_io_trace_count;
++static unsigned esp32c3_rtc_i2c_pc_trace_count;
++static unsigned esp32c3_radio_trace_count;
++static unsigned esp32c3_radio_fe_trace_count;
++static unsigned esp32c3_radio_ctrl_trace_count;
++static unsigned esp32c3_i2c_trace_count;
++static unsigned esp32c3_i2s_trace_count;
++static unsigned esp32c3_ble_trace_count;
++static unsigned esp32c3_radio_fe_probe_count;
++static uint32_t esp32c3_rtc_i2c_regs[0x100 / sizeof(uint32_t)];
++static uint8_t esp32c3_rtc_i2c_analog[0x100][0x100];
++static uint32_t esp32c3_assist_debug_regs[0x100 / sizeof(uint32_t)];
++
++/* I2S0 is part of the C3 APB window rather than a QEMU device in this
++ * machine.  Model the register handshakes needed by the real ESP-IDF I2S
++ * driver and let GDMA perform the actual descriptor transaction. */
++#define ESP32C3_I2S_REG_COUNT (0x100 / sizeof(uint32_t))
++#define ESP32C3_I2S0_BASE     0x6002d000
++#define ESP32C3_I2S_INT_RAW   0x00c
++#define ESP32C3_I2S_INT_ST    0x010
++#define ESP32C3_I2S_INT_ENA   0x014
++#define ESP32C3_I2S_INT_CLR   0x018
++#define ESP32C3_I2S_RX_CONF   0x020
++#define ESP32C3_I2S_TX_CONF   0x024
++#define ESP32C3_I2S_STATE     0x06c
++#define ESP32C3_I2S_UPDATE    BIT(8)
++#define ESP32C3_I2S_RX_START  BIT(2)
++#define ESP32C3_I2S_TX_START  BIT(2)
++#define ESP32C3_I2S_RX_DONE   BIT(0)
++#define ESP32C3_I2S_TX_DONE   BIT(1)
++#define ESP32C3_I2S_DMA_POLL_MS 15
++static uint32_t esp32c3_i2s_regs[ESP32C3_I2S_REG_COUNT];
++static ESPGdmaState *esp32c3_i2s_gdma;
++static QEMUTimer *esp32c3_i2s_dma_timer;
++static bool esp32c3_i2s_tx_active;
++static bool esp32c3_i2s_rx_active;
++static unsigned esp32c3_i2s_dma_tick_count;
++
++/*
++ * The physical board's ES8311 receives the bytes written to I2S TX.  The
++ * simulator has no physical codec, so expose those exact DMA bytes on the
++ * machine stdout JSON-lines transport.  The Web layer can then play the
++ * firmware's PCM without inventing a tone or changing the firmware program.
++ *
++ * The current AI Passport BSP opens the codec as 16 kHz, 16-bit mono PCM.
++ * The payload is still the unmodified guest DMA buffer; these fields describe
++ * the format used by the supported BSP audio path.
++ */
++#define ESP32C3_AUDIO_SAMPLE_RATE 16000
++#define ESP32C3_AUDIO_CHANNELS 1
++
++static void esp32c3_emit_audio(const uint8_t *pcm, size_t bytes)
++{
++    if (!pcm || bytes == 0 || (bytes & 1)) {
++        return;
++    }
++    g_autofree gchar *encoded = g_base64_encode(pcm, bytes);
++    g_print("{\"type\":\"audio\",\"dir\":\"play\","
++            "\"format\":\"pcm-s16le\",\"rate\":%u,"
++            "\"channels\":%u,\"samples\":\"%s\"}\n",
++            ESP32C3_AUDIO_SAMPLE_RATE, ESP32C3_AUDIO_CHANNELS, encoded);
++    fflush(stdout);
++}
++
++static void esp32c3_i2s_trace(const char *op, hwaddr offset,
++                              uint32_t value)
++{
++    if (esp32c3_i2s_trace_count >= ESP32C3_I2S_TRACE_LIMIT) {
++        return;
++    }
++    vaddr pc = current_cpu && current_cpu->cc->get_pc
++        ? current_cpu->cc->get_pc(current_cpu) : 0;
++    fprintf(stderr,
++            "[ESP32-C3 I2S TRACE] %s pc=0x%08llx off=0x%03llx value=0x%08x\\n",
++            op, (unsigned long long)pc, (unsigned long long)offset, value);
++    esp32c3_i2s_trace_count++;
++}
++
++static uint32_t esp32c3_i2s_status(void)
++{
++    return esp32c3_i2s_regs[ESP32C3_I2S_INT_RAW >> 2] &
++           esp32c3_i2s_regs[ESP32C3_I2S_INT_ENA >> 2];
++}
++
++static void esp32c3_i2s_complete_dma(bool tx)
++{
++    static uint8_t tx_sink[4096];
++    static uint8_t rx_source[4096];
++    uint32_t chan = 0;
++    uint32_t transferred = 0;
++    bool ok = false;
++    bool found = false;
++
++    if (esp32c3_i2s_gdma &&
++        esp_gdma_get_channel_periph(esp32c3_i2s_gdma, GDMA_I2S0,
++                                    tx ? ESP_GDMA_OUT_IDX : ESP_GDMA_IN_IDX,
++                                    &chan)) {
++        found = true;
++        const uint32_t raw = esp_gdma_read_chan_register(
++            esp32c3_i2s_gdma,
++            tx ? ESP_GDMA_OUT_IDX : ESP_GDMA_IN_IDX,
++            chan, GDMA_INT_RAW_REG);
++        const uint32_t status = esp_gdma_read_chan_register(
++            esp32c3_i2s_gdma,
++            tx ? ESP_GDMA_OUT_IDX : ESP_GDMA_IN_IDX,
++            chan, GDMA_INT_ST_REG);
++        const uint32_t ena = esp_gdma_read_chan_register(
++            esp32c3_i2s_gdma,
++            tx ? ESP_GDMA_OUT_IDX : ESP_GDMA_IN_IDX,
++            chan, GDMA_INT_ENA_REG);
++        const uint32_t completion_mask = tx
++            ? (R_GDMA_INTERRUPT_OUT_DONE_MASK |
++               R_GDMA_INTERRUPT_OUT_EOF_MASK |
++               R_GDMA_INTERRUPT_OUT_TOTAL_EOF_MASK)
++            : (R_GDMA_INTERRUPT_IN_DONE_MASK |
++               R_GDMA_INTERRUPT_IN_SUC_EOF_MASK);
++
++        /* GDMA completion is the interrupt source used by the IDF I2S
++         * driver.  Do not enqueue another descriptor while the previous
++         * completion is still pending; doing so turns a host timer into an
++         * interrupt storm and can starve the guest's input task. */
++        fprintf(stderr,
++                "[ESP32-C3 I2S DMA STATE] dir=%s chan=%u raw=0x%08x st=0x%08x ena=0x%08x mask=0x%08x desc=0x%08x eof=0x%08x\n",
++                tx ? "TX" : "RX", chan, raw, status, ena, completion_mask,
++                (uint32_t)esp_gdma_read_chan_register(
++                    esp32c3_i2s_gdma,
++                    tx ? ESP_GDMA_OUT_IDX : ESP_GDMA_IN_IDX,
++                    chan, GDMA_DESC_ADDR_REG),
++                (uint32_t)esp_gdma_read_chan_register(
++                    esp32c3_i2s_gdma,
++                    tx ? ESP_GDMA_OUT_IDX : ESP_GDMA_IN_IDX,
++                    chan, GDMA_SUC_EOF_DESC_REG));
++        if (status & completion_mask) {
++            return;
++        }
++        /* I2S raises OUT EOF at descriptor boundaries.  Service exactly one
++         * guest-owned descriptor so the real IDF ISR can observe its EOF
++         * address and recycle/refill the ring before the next transaction. */
++        ok = tx
++            ? esp_gdma_read_channel_one(esp32c3_i2s_gdma, chan, tx_sink,
++                                        sizeof(tx_sink), &transferred)
++            : esp_gdma_write_channel_one(esp32c3_i2s_gdma, chan, rx_source,
++                                         sizeof(rx_source));
++        if (tx && ok) {
++            /* Forward exactly the descriptor bytes consumed from guest RAM;
++             * the first descriptor can be 960 bytes while subsequent ring
++             * nodes are commonly 480 bytes. */
++            esp32c3_emit_audio(tx_sink, transferred);
++        }
++    }
++
++    fprintf(stderr,
++            "[ESP32-C3 I2S DMA] dir=%s found=%d chan=%u ok=%d\n",
++            tx ? "TX" : "RX", found, chan, ok);
++
++    esp32c3_i2s_regs[ESP32C3_I2S_INT_RAW >> 2] |=
++        tx ? ESP32C3_I2S_TX_DONE : ESP32C3_I2S_RX_DONE;
++    esp32c3_i2s_trace(tx ? "TX_DONE" : "RX_DONE", 0,
++                      (ok ? 0x80000000u : 0) |
++                      esp32c3_i2s_regs[ESP32C3_I2S_INT_RAW >> 2]);
++}
++
++static void esp32c3_i2s_dma_tick(void *opaque)
++{
++    (void)opaque;
++
++    if (esp32c3_i2s_dma_tick_count < 32) {
++        fprintf(stderr,
++                "[ESP32-C3 I2S DMA TICK] count=%u tx=%d rx=%d now=%llu\n",
++                esp32c3_i2s_dma_tick_count,
++                esp32c3_i2s_tx_active,
++                esp32c3_i2s_rx_active,
++                (unsigned long long)qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
++        esp32c3_i2s_dma_tick_count++;
++    }
++
++    /* The real I2S engine advances one linked-list node while the previous
++     * completion interrupt is being serviced.  Use the host clock to model
++     * that asynchronous engine.  This firmware routes completion through the
++     * GDMA interrupt rather than I2S INT_RAW; the GDMA transfer path clears
++     * its own completion state when the next node starts. */
++    if (esp32c3_i2s_tx_active) {
++        esp32c3_i2s_complete_dma(true);
++    }
++    if (esp32c3_i2s_rx_active) {
++        esp32c3_i2s_complete_dma(false);
++    }
++
++    if (esp32c3_i2s_tx_active || esp32c3_i2s_rx_active) {
++        timer_mod_ns(esp32c3_i2s_dma_timer,
++                     qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
++                     ESP32C3_I2S_DMA_POLL_MS * SCALE_MS);
++    }
++}
++
++static uint32_t esp32c3_i2s_read(hwaddr offset)
++{
++    uint32_t value = 0;
++    switch (offset) {
++    case ESP32C3_I2S_INT_ST:
++        value = esp32c3_i2s_status();
++        break;
++    case ESP32C3_I2S_STATE:
++        value = BIT(0);
++        break;
++    default:
++        value = esp32c3_i2s_regs[offset >> 2];
++        break;
++    }
++    esp32c3_i2s_trace("R", offset, value);
++    return value;
++}
++
++static void esp32c3_i2s_write(hwaddr offset, uint32_t value)
++{
++    esp32c3_i2s_trace("W", offset, value);
++    switch (offset) {
++    case ESP32C3_I2S_INT_RAW:
++        /* Read-only on the C3; retain the hardware-produced status. */
++        break;
++    case ESP32C3_I2S_INT_CLR:
++        esp32c3_i2s_regs[ESP32C3_I2S_INT_RAW >> 2] &= ~value;
++        break;
++    case ESP32C3_I2S_INT_ENA:
++        esp32c3_i2s_regs[offset >> 2] = value;
++        break;
++    case ESP32C3_I2S_RX_CONF:
++        /* RX_UPDATE is a self-clearing APB-to-I2S clock-domain handshake. */
++        esp32c3_i2s_regs[offset >> 2] = value &
++            ~(ESP32C3_I2S_RX_START | ESP32C3_I2S_UPDATE);
++        if (value & ESP32C3_I2S_RX_START) {
++            esp32c3_i2s_rx_active = true;
++            esp32c3_i2s_complete_dma(false);
++            timer_mod_ns(esp32c3_i2s_dma_timer,
++                         qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
++                         ESP32C3_I2S_DMA_POLL_MS * SCALE_MS);
++        }
++        break;
++    case ESP32C3_I2S_TX_CONF:
++        /* TX_UPDATE is a self-clearing APB-to-I2S clock-domain handshake. */
++        esp32c3_i2s_regs[offset >> 2] = value &
++            ~(ESP32C3_I2S_TX_START | ESP32C3_I2S_UPDATE);
++        if (value & ESP32C3_I2S_TX_START) {
++            esp32c3_i2s_tx_active = true;
++            esp32c3_i2s_complete_dma(true);
++            timer_mod_ns(esp32c3_i2s_dma_timer,
++                         qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
++                         ESP32C3_I2S_DMA_POLL_MS * SCALE_MS);
++        }
++        break;
++    default:
++        esp32c3_i2s_regs[offset >> 2] = value;
++        break;
++    }
++}
++/*
++ * The ESP32-C3 BLE controller uses a private register window which is not
++ * described by the public C3 register header.  The controller bootstrap
++ * writes configuration/status words there and immediately reads them back.
++ * Returning zero for every read makes the real controller binary lose its
++ * state machine and eventually assert in emi.c.  Keep the window as ordinary
++ * deterministic MMIO storage until a more complete BTDM model is needed.
++ */
++static uint32_t esp32c3_ble_regs[ESP32C3_BLE_REG_COUNT];
++/*
++ * The ROM/BT controller uses 0x6003101c as a command/status register during
++ * BLE bring-up.  A plain read-after-write register is not sufficient here:
++ * the guest writes bit 31 as a busy command and then polls until hardware
++ * clears it.  Keep the observed command value for one poll, then complete
++ * the transaction by clearing only the observed busy bit.  This is a small
++ * transaction model derived from the real guest trace, not a synthetic BLE
++ * application state machine.
++ */
++#define ESP32C3_BLE_CMD_STATUS_REG 0x6003101c
++#define ESP32C3_BLE_BASE_STATUS_REG 0x60031000
++#define ESP32C3_BLE_SYS_STATUS_REG 0x60031004
++#define ESP32C3_BLE_SYS_STATUS_READY 0x09001b00
++static unsigned esp32c3_ble_cmd_status_polls;
++
++/* The ESP32-C3 RF frontend exposes a power-up/status bit at FE+0x174.
++ * The ROM/PHY bring-up code waits for this bit before it polls the
++ * controller status window at 0x6001c08c.  A real chip asserts it once the
++ * RF clock domain is powered; the QEMU model has no analog power domain, so
++ * model the completed digital state explicitly. */
++#define ESP32C3_RADIO_FE_READY BIT(16)
++
++/* The ESP32-C3 ROM/clock code uses otherwise undocumented state bits in the
++ * RTC-I2C command window while waiting for the internal analog-I2C sequencer.
++ * The boot ROM polls bit 24 of the command word as its completion indication;
++ * without this bit the ROM remains in a tight loop before app_main(). */
++#define ESP32C3_RTC_I2C_CMD6_OFFSET 0x050
++#define ESP32C3_RTC_I2C_MAIN_STATE_DONE (7u << 24)
++#define ESP32C3_RTC_I2C_CMD_FIRST_OFFSET 0x038
++#define ESP32C3_RTC_I2C_CMD_LAST_OFFSET  0x074
++
++#define ESP32C3_ASSIST_DEBUG_WINDOW_SIZE 0x100
++
++static uint32_t esp32c3_rtc_i2c_read_reg(hwaddr offset)
++{
++    uint32_t value = esp32c3_rtc_i2c_regs[offset >> 2];
++    return value;
++}
++
+ /* Create a macro which defines the name of our new machine class */
+ #define TYPE_ESP32C3_MACHINE MACHINE_TYPE_NAME("esp32c3")
+ 
+@@ -116,6 +650,7 @@ enum MemoryRegions {
+     ESP32C3_MEMREGION_RTCFAST,
+     ESP32C3_MEMREGION_DCACHE,
+     ESP32C3_MEMREGION_ICACHE,
++    ESP32C3_MEMREGION_BTDM,
+     ESP32C3_MEMREGION_FRAMEBUF,
+ };
+ 
+@@ -133,6 +668,14 @@ static const struct MemmapEntry {
+     [ESP32C3_MEMREGION_RTCFAST] = { 0x50000000,   0x2000 },
+     [ESP32C3_MEMREGION_DCACHE]  = { 0x3c000000, 0x800000 },
+     [ESP32C3_MEMREGION_ICACHE]  = { 0x42000000, 0x800000 },
++    /*
++     * The ESP32-C3 BLE controller binary used by ESP-IDF 5.x accesses a
++     * small controller workspace through the 0x3fc00000 alias while it is
++     * being brought up.  This window is not part of the application DRAM
++     * linker region, so keep it separate from the normal 0x3fc80000 RAM
++     * mapping and expose it as ordinary internal RAM.
++     */
++    [ESP32C3_MEMREGION_BTDM]     = { 0x3fc00000, 0x8000 },
+     /* Virtual Framebuffer, used for the graphical interface */
+     [ESP32C3_MEMREGION_FRAMEBUF] = { 0x20000000, ESP_RGB_MAX_VRAM_SIZE }
+ };
+@@ -145,12 +688,174 @@ static bool addr_in_range(hwaddr addr, hwaddr start, hwaddr end)
+ 
+ static uint64_t esp32c3_io_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+-    if (addr_in_range(addr + ESP32C3_IO_START_ADDR, DR_REG_RTC_I2C_BASE, DR_REG_RTC_I2C_BASE + 0x100)) {
+-        return (uint32_t) 0xffffff;
+-    } else if (addr + ESP32C3_IO_START_ADDR == DR_REG_SYSCON_BASE + A_SYSCON_ORIGIN_REG) {
++    const hwaddr absolute = addr + ESP32C3_IO_START_ADDR;
++    uint32_t ble_value = 0;
++
++    if (addr_in_range(absolute, ESP32C3_BLE_REG_START, ESP32C3_BLE_REG_END) &&
++        (absolute & 0x3) == 0) {
++        ble_value = esp32c3_ble_regs[(absolute - ESP32C3_BLE_REG_START) >> 2];
++        if (absolute == ESP32C3_BLE_CMD_STATUS_REG &&
++            (ble_value & BIT(31)) && esp32c3_ble_cmd_status_polls++ > 0) {
++            ble_value &= ~BIT(31);
++            esp32c3_ble_regs[(absolute - ESP32C3_BLE_REG_START) >> 2] = ble_value;
++        }
++        if (absolute == ESP32C3_BLE_BASE_STATUS_REG && (ble_value & BIT(31))) {
++            /* The real firmware writes bit 31 to the base controller status
++             * word and then spins on the same address until the controller
++             * clears it.  Complete that observed transaction on the first
++             * poll so the guest can continue to the next BLE stage. */
++            ble_value &= ~BIT(31);
++            esp32c3_ble_regs[(absolute - ESP32C3_BLE_REG_START) >> 2] = ble_value;
++        }
++        if (absolute == ESP32C3_BLE_SYS_STATUS_REG) {
++            /* The firmware compares this status word against the controller
++             * ready signature before continuing BLE initialization. */
++            ble_value = ESP32C3_BLE_SYS_STATUS_READY;
++        }
++    }
++
++    if (esp32c3_ble_trace_count < ESP32C3_BLE_TRACE_LIMIT &&
++        addr_in_range(absolute, ESP32C3_BLE_REG_START, ESP32C3_BLE_REG_END)) {
++        vaddr pc = current_cpu && current_cpu->cc->get_pc
++            ? current_cpu->cc->get_pc(current_cpu) : 0;
++        fprintf(stderr,
++                "[ESP32-C3 BLE TRACE] R abs=0x%08llx pc=0x%08llx size=%u -> 0x%08x\\n",
++                (unsigned long long)absolute,
++                (unsigned long long)pc,
++                size,
++                ble_value);
++        esp32c3_ble_trace_count++;
++    }
++
++    if (addr_in_range(absolute, ESP32C3_BLE_REG_START, ESP32C3_BLE_REG_END)) {
++        if ((absolute & 0x3) == 0) {
++            return ble_value;
++        }
++        return 0;
++    }
++
++    if (addr_in_range(absolute, ESP32C3_I2S0_BASE,
++                      ESP32C3_I2S0_BASE + 0x100) &&
++        (absolute & 0x3) == 0) {
++        return esp32c3_i2s_read(absolute - ESP32C3_I2S0_BASE);
++    }
++
++    if (esp32c3_i2c_trace_count < ESP32C3_I2C_TRACE_LIMIT &&
++        addr_in_range(absolute, DR_REG_I2C_EXT_BASE,
++                      DR_REG_I2C_EXT_BASE + 0x100)) {
++        vaddr pc = current_cpu && current_cpu->cc->get_pc
++            ? current_cpu->cc->get_pc(current_cpu) : 0;
++        fprintf(stderr,
++                "[ESP32-C3 I2C TRACE] R pc=0x%08llx off=0x%03llx size=%u\\n",
++                (unsigned long long)pc,
++                (unsigned long long)(absolute - DR_REG_I2C_EXT_BASE),
++                size);
++        esp32c3_i2c_trace_count++;
++    }
++
++    if (esp32c3_io_trace_count < ESP32C3_IO_TRACE_LIMIT &&
++        absolute >= 0x6000d000 && absolute < 0x6000f000) {
++        fprintf(stderr, "[ESP32-C3 IO TRACE] R abs=0x%08lx addr=0x%08lx size=%u\n",
++                (hwaddr)absolute, (hwaddr)addr, size);
++        esp32c3_io_trace_count++;
++    }
++
++    if (addr_in_range(absolute, DR_REG_RTC_I2C_BASE, DR_REG_RTC_I2C_BASE + 0x100)) {
++        hwaddr offset = absolute - DR_REG_RTC_I2C_BASE;
++        uint32_t value = 0;
++        if ((offset & 0x3) == 0) {
++            unsigned index = (unsigned)(offset >> 2);
++            value = esp32c3_rtc_i2c_read_reg(offset);
++            if (offset == ESP32C3_RTC_I2C_CMD6_OFFSET) {
++                /*
++                 * The C3 ROM uses CMD6 as the analog-I2C controller's
++                 * completion/status window.  The public register header
++                 * exposes only the programmable command payload here, but
++                 * the ROM polls bits 24..26 and waits for state 7 after each
++                 * command submission.  Complete transactions immediately
++                 * so the real firmware can leave its clock/ADC bootstrap.
++                 */
++                value |= ESP32C3_RTC_I2C_MAIN_STATE_DONE;
++                esp32c3_rtc_i2c_regs[index] = value;
++            }
++            /*
++             * Complete the ROM's internal analog-I2C mailbox synchronously.
++             * Use the raw guest-written value for command detection; status
++             * bits injected below must not be mistaken for a new command.
++             */
++            if (offset != ESP32C3_RTC_I2C_CMD6_OFFSET && (value & BIT(26))) {
++                /*
++                 * The ESP32-C3 ROM regi2c helper uses bit 25 of the command
++                 * word as its busy flag and consumes bits 16..23 as the
++                 * returned analog-register byte.  Complete the transaction
++                 * synchronously and return the last byte stored for the
++                 * selected block/register.
++                 */
++                uint8_t block = (uint8_t)(value & 0xff);
++                uint8_t reg_add = (uint8_t)((value >> 8) & 0xff);
++                uint8_t data = esp32c3_rtc_i2c_analog[block][reg_add];
++                if (offset != ESP32C3_RTC_I2C_CMD6_OFFSET) {
++                    value &= ~BIT(25);
++                }
++                value = (value & ~(0xffu << 16)) | ((uint32_t)data << 16);
++                esp32c3_rtc_i2c_regs[index] = value;
++            }
++            if (offset >= ESP32C3_RTC_I2C_CMD_FIRST_OFFSET &&
++                offset <= ESP32C3_RTC_I2C_CMD_LAST_OFFSET) {
++                /* The public command window is software-readable.  The ROM
++                 * uses bit 24 as the synchronous completion flag. */
++                value |= BIT(24);
++                value = esp32c3_rtc_i2c_regs[index];
++                value |= BIT(24);
++            }
++            if (esp32c3_rtc_i2c_trace_count < ESP32C3_RTC_TRACE_LIMIT &&
++                ((offset >= ESP32C3_RTC_I2C_CMD_FIRST_OFFSET &&
++                  offset <= ESP32C3_RTC_I2C_CMD_LAST_OFFSET) ||
++                 absolute == DR_REG_RTC_I2C_BASE)) {
++                if (offset == ESP32C3_RTC_I2C_CMD6_OFFSET &&
++                    esp32c3_rtc_i2c_pc_trace_count < 64) {
++                    vaddr pc = current_cpu && current_cpu->cc->get_pc
++                        ? current_cpu->cc->get_pc(current_cpu) : 0;
++                    fprintf(stderr,
++                            "[ESP32-C3 RTC TRACE] CMD6 pc=0x%08llx value=0x%08x\\n",
++                            (unsigned long long)pc, value);
++                    esp32c3_rtc_i2c_pc_trace_count++;
++                }
++                fprintf(stderr,
++                        "[ESP32-C3 RTC TRACE] R abs=0x%08llx off=0x%03llx value=0x%08x\n",
++                        (unsigned long long)absolute,
++                        (unsigned long long)offset,
++                        value);
++            }
++        }
++        return value;
++    } else if (addr_in_range(absolute, DR_REG_ASSIST_DEBUG_BASE,
++                             DR_REG_ASSIST_DEBUG_BASE + ESP32C3_ASSIST_DEBUG_WINDOW_SIZE)) {
++        hwaddr offset = absolute - DR_REG_ASSIST_DEBUG_BASE;
++        if ((offset & 0x3) == 0) {
++            if (offset == A_ASSIST_DEBUG_CORE_0_DEBUG_MODE_REG) {
++                return 0;
++            }
++            return esp32c3_assist_debug_regs[offset >> 2];
++        }
++        return 0;
++    } else if (addr_in_range(absolute, DR_REG_APB_SARADC_BASE,
++                             DR_REG_APB_SARADC_BASE + 0x400)) {
++        hwaddr offset = absolute - DR_REG_APB_SARADC_BASE;
++        if ((offset & 0x3) == 0) {
++            return esp32c3_saradc_read(offset);
++        }
++        return 0;
++    } else if (absolute == DR_REG_SYSCON_BASE + 0x014) {
++        /* SYSCON_WIFI_CLK_EN_REG: modem/PHY clock gate state. */
++        return esp32c3_syscon_wifi_clk_en;
++    } else if (absolute == DR_REG_SYSCON_BASE + 0x018) {
++        /* SYSCON_WIFI_RST_EN_REG: modem reset state. */
++        return esp32c3_syscon_wifi_rst_en;
++    } else if (absolute == DR_REG_SYSCON_BASE + A_SYSCON_ORIGIN_REG) {
+         /* Return "QEMU" as a 32-bit value */
+         return 0x51454d55;
+-    } else if (addr + ESP32C3_IO_START_ADDR == DR_REG_SYSCON_BASE + A_SYSCON_RND_DATA_REG) {
++    } else if (absolute == DR_REG_SYSCON_BASE + A_SYSCON_RND_DATA_REG) {
+         /* Return a random 32-bit value */
+         static bool init = false;
+         if (!init) {
+@@ -158,7 +863,36 @@ static uint64_t esp32c3_io_read(void *opaque, hwaddr addr, unsigned int size)
+             init = true;
+         }
+         return rand();
+-    } else if (addr + ESP32C3_IO_START_ADDR == DR_REG_ASSIST_DEBUG_BASE + A_ASSIST_DEBUG_CORE_0_DEBUG_MODE_REG) {
++    } else if (absolute == 0x60006174 || absolute == 0x6001c08c) {
++        unsigned *trace_count = absolute == 0x60006174
++            ? &esp32c3_radio_fe_trace_count : &esp32c3_radio_trace_count;
++        uint32_t value = 0;
++        if (absolute == 0x60006174) {
++            /* The first read observes the RF power-up transition.  The
++             * following read sees the completed state, matching the
++             * firmware's two-stage probe (clear -> ready). */
++            value = esp32c3_radio_fe_probe_count++ == 0
++                ? 0 : ESP32C3_RADIO_FE_READY;
++        } else {
++            /*
++             * The real firmware then polls the RF controller state window at
++             * 0x6001c08c.  QEMU has no analog RF domain, so expose the same
++             * completed state bit used by the preceding RF power-up probe;
++             * returning zero leaves the guest in the observed tight loop.
++             */
++            value = ESP32C3_RADIO_FE_READY;
++        }
++        if (*trace_count < 96) {
++            vaddr pc = current_cpu && current_cpu->cc->get_pc
++                ? current_cpu->cc->get_pc(current_cpu) : 0;
++            fprintf(stderr,
++                    "[ESP32-C3 RADIO TRACE] R abs=0x%08llx pc=0x%08llx -> 0x%08x\\n",
++                    (unsigned long long)absolute,
++                    (unsigned long long)pc, value);
++            (*trace_count)++;
++        }
++        return value;
++    } else if (absolute == DR_REG_ASSIST_DEBUG_BASE + A_ASSIST_DEBUG_CORE_0_DEBUG_MODE_REG) {
+         return 0;
+     } else {
+ #if ESP32C3_IO_WARNING
+@@ -170,6 +904,124 @@ static uint64_t esp32c3_io_read(void *opaque, hwaddr addr, unsigned int size)
+ 
+ static void esp32c3_io_write(void *opaque, hwaddr addr, uint64_t value, unsigned int size)
+ {
++    const hwaddr absolute = addr + ESP32C3_IO_START_ADDR;
++
++    if (esp32c3_ble_trace_count < ESP32C3_BLE_TRACE_LIMIT &&
++        addr_in_range(absolute, ESP32C3_BLE_REG_START, ESP32C3_BLE_REG_END)) {
++        vaddr pc = current_cpu && current_cpu->cc->get_pc
++            ? current_cpu->cc->get_pc(current_cpu) : 0;
++        fprintf(stderr,
++                "[ESP32-C3 BLE TRACE] W abs=0x%08llx pc=0x%08llx size=%u value=0x%08llx\\n",
++                (unsigned long long)absolute,
++                (unsigned long long)pc,
++                size,
++                (unsigned long long)value);
++        esp32c3_ble_trace_count++;
++    }
++
++    if (addr_in_range(absolute, ESP32C3_BLE_REG_START, ESP32C3_BLE_REG_END)) {
++        if ((absolute & 0x3) == 0) {
++            esp32c3_ble_regs[(absolute - ESP32C3_BLE_REG_START) >> 2] = (uint32_t)value;
++            if (absolute == ESP32C3_BLE_CMD_STATUS_REG) {
++                esp32c3_ble_cmd_status_polls = 0;
++            }
++        }
++        return;
++    }
++
++    if (addr_in_range(absolute, ESP32C3_I2S0_BASE,
++                      ESP32C3_I2S0_BASE + 0x100) &&
++        (absolute & 0x3) == 0) {
++        esp32c3_i2s_write(absolute - ESP32C3_I2S0_BASE, (uint32_t)value);
++        return;
++    }
++
++    if (esp32c3_i2c_trace_count < ESP32C3_I2C_TRACE_LIMIT &&
++        addr_in_range(absolute, DR_REG_I2C_EXT_BASE,
++                      DR_REG_I2C_EXT_BASE + 0x100)) {
++        vaddr pc = current_cpu && current_cpu->cc->get_pc
++            ? current_cpu->cc->get_pc(current_cpu) : 0;
++        fprintf(stderr,
++                "[ESP32-C3 I2C TRACE] W pc=0x%08llx off=0x%03llx size=%u value=0x%08llx\\n",
++                (unsigned long long)pc,
++                (unsigned long long)(absolute - DR_REG_I2C_EXT_BASE),
++                size, (unsigned long long)value);
++        esp32c3_i2c_trace_count++;
++    }
++
++    if (esp32c3_io_trace_count < ESP32C3_IO_TRACE_LIMIT &&
++        absolute >= 0x6000d000 && absolute < 0x6000f000) {
++        fprintf(stderr, "[ESP32-C3 IO TRACE] W abs=0x%08lx addr=0x%08lx size=%u value=0x%08lx\n",
++                (hwaddr)absolute, (hwaddr)addr, size, (hwaddr)value);
++        esp32c3_io_trace_count++;
++    }
++
++    if (addr_in_range(absolute, DR_REG_RTC_I2C_BASE, DR_REG_RTC_I2C_BASE + 0x100)) {
++        hwaddr offset = absolute - DR_REG_RTC_I2C_BASE;
++        if ((offset & 0x3) == 0) {
++            unsigned index = (unsigned)(offset >> 2);
++            if (esp32c3_rtc_i2c_trace_count < ESP32C3_RTC_TRACE_LIMIT &&
++                offset == 0x04c) {
++                vaddr pc = current_cpu && current_cpu->cc->get_pc
++                    ? current_cpu->cc->get_pc(current_cpu) : 0;
++                fprintf(stderr,
++                        "[ESP32-C3 RTC TRACE] W pc=0x%08llx off=0x%03llx value=0x%08llx\\n",
++                        (unsigned long long)pc,
++                        (unsigned long long)offset,
++                        (unsigned long long)value);
++                esp32c3_rtc_i2c_trace_count++;
++            }
++            esp32c3_rtc_i2c_regs[index] = (uint32_t)value;
++            if (offset >= ESP32C3_RTC_I2C_CMD_FIRST_OFFSET &&
++                offset <= ESP32C3_RTC_I2C_CMD_LAST_OFFSET) {
++                /* Complete the ROM's analog-I2C command synchronously. */
++                esp32c3_rtc_i2c_regs[index] |= BIT(24);
++            }
++            if (value & BIT(26)) {
++                uint8_t block = (uint8_t)(value & 0xff);
++                uint8_t reg_add = (uint8_t)((value >> 8) & 0xff);
++                uint8_t data = (uint8_t)((value >> 16) & 0xff);
++                if (value & BIT(24)) {
++                    esp32c3_rtc_i2c_analog[block][reg_add] = data;
++                }
++                esp32c3_rtc_i2c_regs[index] &= ~(BIT(24) | BIT(25));
++            }
++        }
++        return;
++    } else if (addr_in_range(absolute, DR_REG_ASSIST_DEBUG_BASE,
++                             DR_REG_ASSIST_DEBUG_BASE + ESP32C3_ASSIST_DEBUG_WINDOW_SIZE)) {
++        hwaddr offset = absolute - DR_REG_ASSIST_DEBUG_BASE;
++        if ((offset & 0x3) == 0 && offset != A_ASSIST_DEBUG_CORE_0_DEBUG_MODE_REG) {
++            esp32c3_assist_debug_regs[offset >> 2] = (uint32_t)value;
++        }
++        return;
++    } else if (addr_in_range(absolute, DR_REG_APB_SARADC_BASE,
++                             DR_REG_APB_SARADC_BASE + 0x400)) {
++        hwaddr offset = absolute - DR_REG_APB_SARADC_BASE;
++        if ((offset & 0x3) == 0) {
++            esp32c3_saradc_write(offset, (uint32_t)value);
++        }
++        return;
++    } else if (absolute == DR_REG_SYSCON_BASE + 0x014) {
++        esp32c3_syscon_wifi_clk_en = (uint32_t)value;
++        return;
++    } else if (absolute == DR_REG_SYSCON_BASE + 0x018) {
++        esp32c3_syscon_wifi_rst_en = (uint32_t)value;
++        return;
++    } else if (absolute == 0x60006174 || absolute == 0x6001c08c) {
++        if (esp32c3_radio_ctrl_trace_count < 96) {
++            vaddr pc = current_cpu && current_cpu->cc->get_pc
++                ? current_cpu->cc->get_pc(current_cpu) : 0;
++            fprintf(stderr,
++                    "[ESP32-C3 RADIO TRACE] W abs=0x%08llx pc=0x%08llx value=0x%08llx\\n",
++                    (unsigned long long)absolute,
++                    (unsigned long long)pc,
++                    (unsigned long long)value);
++            esp32c3_radio_ctrl_trace_count++;
++        }
++        return;
++    }
++
+ #if ESP32C3_IO_WARNING
+         warn_report("[ESP32-C3] Unsupported write $%08lx = %08lx\n", ESP32C3_IO_START_ADDR + addr, value);
+ #endif
+@@ -377,6 +1229,13 @@ static void esp32c3_machine_init(MachineState *machine)
+     memory_region_init_ram(rtcram, NULL, "esp32c3.rtcram", memmap[ESP32C3_MEMREGION_RTCFAST].size, &error_fatal);
+     memory_region_add_subregion(sys_mem, memmap[ESP32C3_MEMREGION_RTCFAST].base, rtcram);
+ 
++    /* BLE controller bootstrap workspace (0x3fc00000 alias). */
++    MemoryRegion *btdmram = g_new(MemoryRegion, 1);
++    memory_region_init_ram(btdmram, NULL, "esp32c3.btdmram",
++                           memmap[ESP32C3_MEMREGION_BTDM].size, &error_fatal);
++    memory_region_add_subregion(sys_mem, memmap[ESP32C3_MEMREGION_BTDM].base,
++                                btdmram);
++
+     esp32c3_load_firmware(machine);
+ 
+     qdev_realize(DEVICE(&ms->soc), NULL, &error_fatal);
+@@ -406,6 +1265,7 @@ static void esp32c3_machine_init(MachineState *machine)
+ 
+     object_initialize_child(OBJECT(machine), "intmatrix", &ms->intmatrix, TYPE_ESP32C3_INTMATRIX);
+     object_initialize_child(OBJECT(machine), "gpio", &ms->gpio, TYPE_ESP32C3_GPIO);
++    esp32c3_gpio_state = &ms->gpio;
+     object_initialize_child(OBJECT(machine), "extmem", &ms->cache, TYPE_ESP32C3_CACHE);
+     object_initialize_child(OBJECT(machine), "efuse", &ms->efuse, TYPE_ESP32C3_EFUSE);
+     object_initialize_child(OBJECT(machine), "clock", &ms->clock, TYPE_ESP32C3_CLOCK);
+@@ -420,6 +1280,8 @@ static void esp32c3_machine_init(MachineState *machine)
+     object_initialize_child(OBJECT(machine), "timg1", &ms->timg[1], TYPE_ESP32C3_TIMG);
+     object_initialize_child(OBJECT(machine), "systimer", &ms->systimer, TYPE_ESP32C3_SYSTIMER);
+     object_initialize_child(OBJECT(machine), "spi1", &ms->spi1, TYPE_ESP32C3_SPI);
++    object_initialize_child(OBJECT(machine), "spi2", &ms->spi2, TYPE_ESP32C3_SPI);
++    object_initialize_child(OBJECT(machine), "i2c0", &ms->i2c0, TYPE_ESP32_I2C);
+     object_initialize_child(OBJECT(machine), "rtccntl", &ms->rtccntl, TYPE_ESP32C3_RTC_CNTL);
+     object_initialize_child(OBJECT(machine), "jtag", &ms->jtag, TYPE_ESP32C3_JTAG);
+     object_initialize_child(OBJECT(machine), "rgb", &ms->rgb, TYPE_ESP_RGB);
+@@ -569,8 +1431,10 @@ static void esp32c3_machine_init(MachineState *machine)
+ 
+     /* GDMA Realization */
+     {
+-        object_property_set_link(OBJECT(&ms->gdma), "soc_mr", OBJECT(dram), &error_abort);
++        /* GDMA descriptors contain complete ESP32-C3 physical addresses. */
++        object_property_set_link(OBJECT(&ms->gdma), "soc_mr", OBJECT(sys_mem), &error_abort);
+         sysbus_realize(SYS_BUS_DEVICE(&ms->gdma), &error_fatal);
++        esp32c3_i2s_gdma = &ms->gdma.parent;
+         MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ms->gdma), 0);
+         memory_region_add_subregion_overlap(sys_mem, DR_REG_GDMA_BASE, mr, 0);
+         /* On the ESP32-C3, both IN and OUT channels are connected to the same Connect the IRQs to the Interrupt Matrix */
+@@ -583,6 +1447,40 @@ static void esp32c3_machine_init(MachineState *machine)
+ 
+     }
+ 
++    /* I2C controller and the two board devices used by the original BSP. */
++    {
++        sysbus_realize(SYS_BUS_DEVICE(&ms->i2c0), &error_fatal);
++        MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ms->i2c0), 0);
++        memory_region_add_subregion_overlap(sys_mem, DR_REG_I2C_EXT_BASE, mr, 0);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&ms->i2c0), 0,
++                           qdev_get_gpio_in(intmatrix_dev, ETS_I2C_EXT0_INTR_SOURCE));
++
++        I2CBus *i2c_bus = qdev_get_child_bus(DEVICE(&ms->i2c0), "i2c");
++        i2c_slave_create_simple(i2c_bus, TYPE_ESP32_I2C_PERIPHERAL, 0x18);
++        i2c_slave_create_simple(i2c_bus, TYPE_ESP32_I2C_PERIPHERAL, 0x63);
++    }
++
++    /* GPSPI2 drives the ST7789 LCD through the real firmware SPI register
++     * sequence.  The LCD D/C line is a normal GPIO output on GPIO20. */
++    {
++        ms->spi2.is_spi2 = true;
++        ms->spi2.gdma = &ms->gdma.parent;
++        sysbus_realize(SYS_BUS_DEVICE(&ms->spi2), &error_fatal);
++        MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ms->spi2), 0);
++        memory_region_add_subregion_overlap(sys_mem, DR_REG_SPI2_BASE, mr, 0);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&ms->spi2), 0,
++                           qdev_get_gpio_in(intmatrix_dev, ETS_SPI2_INTR_SOURCE));
++
++        SSIBus *spi2_bus = qdev_get_child_bus(DEVICE(&ms->spi2), "spi");
++        DeviceState *lcd = qdev_new(TYPE_ST7789);
++        qdev_prop_set_uint8(lcd, "cs", 0);
++        qdev_realize_and_unref(lcd, BUS(spi2_bus), &error_fatal);
++        qdev_connect_gpio_out_named(DEVICE(&ms->spi2), SSI_GPIO_CS, 0,
++                                    qdev_get_gpio_in_named(lcd, SSI_GPIO_CS, 0));
++        qdev_connect_gpio_out(DEVICE(&ms->gpio), 20,
++                              qdev_get_gpio_in_named(lcd, "dc", 0));
++    }
++
+     /* SHA realization */
+     {
+         ms->sha.parent.gdma = ESP_GDMA(&ms->gdma);
+@@ -656,6 +1554,18 @@ static void esp32c3_machine_init(MachineState *machine)
+     memory_region_add_subregion_overlap(sys_mem, DR_REG_TWAI_BASE, twai_mr, 0);
+     sysbus_connect_irq(SYS_BUS_DEVICE(&ms->twai), 0,
+                        qdev_get_gpio_in(DEVICE(&ms->intmatrix), ETS_TWAI_INTR_SOURCE));
++
++    esp32c3_i2s_dma_timer = timer_new_ms(
++        QEMU_CLOCK_REALTIME, esp32c3_i2s_dma_tick, NULL);
++    esp32c3_button_release_timer = timer_new_ms(
++        QEMU_CLOCK_REALTIME, esp32c3_button_release, NULL);
++    esp32c3_button_second_press_timer = timer_new_ms(
++        QEMU_CLOCK_REALTIME, esp32c3_button_second_press, NULL);
++
++    /* The Web simulator sends JSON Lines on QEMU stdin.  Keep this bridge at
++     * the machine level so the guest still reads the same ADC1_CH0 input
++     * ladder as the physical board. */
++    qemu_set_fd_handler(STDIN_FILENO, esp32c3_input_read, NULL, ms);
+ }
+ 
+ 
+diff --git a/hw/riscv/esp32c3_clk.c b/hw/riscv/esp32c3_clk.c
+index 10aa7f4..219cfa9 100644
+--- a/hw/riscv/esp32c3_clk.c
++++ b/hw/riscv/esp32c3_clk.c
+@@ -59,6 +59,24 @@ static uint64_t esp32c3_clock_read(void *opaque, hwaddr addr, unsigned int size)
+         case A_SYSTEM_SYSCLK_CONF:
+             r = s->sysclk;
+             break;
++        case A_SYSTEM_PERIP_CLK_EN0:
++            r = s->perip_clk_en0;
++            break;
++        case A_SYSTEM_PERIP_CLK_EN1:
++            r = s->perip_clk_en1;
++            break;
++        case A_SYSTEM_PERIP_RST_EN0:
++            r = s->perip_rst_en0;
++            break;
++        case A_SYSTEM_PERIP_RST_EN1:
++            r = s->perip_rst_en1;
++            break;
++        case A_SYSTEM_BT_LPCK_DIV_INT:
++            r = s->bt_lpck_div_int;
++            break;
++        case A_SYSTEM_BT_LPCK_DIV_FRAC:
++            r = s->bt_lpck_div_frac;
++            break;
+         case A_SYSTEM_CPU_INTR_FROM_CPU_0:
+         case A_SYSTEM_CPU_INTR_FROM_CPU_1:
+         case A_SYSTEM_CPU_INTR_FROM_CPU_2:
+@@ -83,6 +101,24 @@ static void esp32c3_clock_write(void *opaque, hwaddr addr, uint64_t value,
+     ESP32C3ClockState *s = ESP32C3_CLOCK(opaque);
+ 
+     switch(addr) {
++        case A_SYSTEM_PERIP_CLK_EN0:
++            s->perip_clk_en0 = value;
++            break;
++        case A_SYSTEM_PERIP_CLK_EN1:
++            s->perip_clk_en1 = value;
++            break;
++        case A_SYSTEM_PERIP_RST_EN0:
++            s->perip_rst_en0 = value;
++            break;
++        case A_SYSTEM_PERIP_RST_EN1:
++            s->perip_rst_en1 = value;
++            break;
++        case A_SYSTEM_BT_LPCK_DIV_INT:
++            s->bt_lpck_div_int = value;
++            break;
++        case A_SYSTEM_BT_LPCK_DIV_FRAC:
++            s->bt_lpck_div_frac = value;
++            break;
+         case A_SYSTEM_CPU_INTR_FROM_CPU_0:
+         case A_SYSTEM_CPU_INTR_FROM_CPU_1:
+         case A_SYSTEM_CPU_INTR_FROM_CPU_2:
+@@ -118,6 +154,12 @@ static void esp32c3_clock_reset_hold(Object *obj, ResetType type)
+     /* Divider for PLL clock and APB  frequency */
+     s->cpuperconf = (ESP32C3_PERIOD_SEL_80 << R_SYSTEM_CPU_PER_CONF_CPUPERIOD_SEL_SHIFT) |
+                     (ESP32C3_FREQ_SEL_PLL_480 << R_SYSTEM_CPU_PER_CONF_PLL_FREQ_SEL_SHIFT);
++    s->perip_clk_en0 = 0;
++    s->perip_clk_en1 = 0;
++    s->perip_rst_en0 = 0;
++    s->perip_rst_en1 = 0;
++    s->bt_lpck_div_int = 0xff;
++    s->bt_lpck_div_frac = BIT(25);
+ 
+     /* Initialize the IRQs */
+     s->levels = 0;
+diff --git a/hw/ssi/esp32c3_spi.c b/hw/ssi/esp32c3_spi.c
+index e8bd33a..5188211 100644
+--- a/hw/ssi/esp32c3_spi.c
++++ b/hw/ssi/esp32c3_spi.c
+@@ -23,6 +23,13 @@
+ 
+ #define SPI1_DEBUG      0
+ #define SPI1_WARNING    0
++/* Temporary bounded diagnostics for firmware display bring-up.  Keep these
++ * disabled again once this protocol trace has identified the missing state. */
++#define SPI2_TRACE_LIMIT 1200
++#define SPI1_TRACE_LIMIT 800
++
++static unsigned esp32c3_spi2_trace_count;
++static unsigned esp32c3_spi1_trace_count;
+ 
+ 
+ enum {
+@@ -56,11 +63,267 @@ typedef struct ESP32C3SpiTransaction {
+     uint32_t rx_bytes;
+ } ESP32C3SpiTransaction;
+ 
++static void esp32c3_spi2_update_irq(ESP32C3SpiState *s)
++{
++    qemu_set_irq(s->irq, !!(s->spi2_dma_int_raw & s->spi2_dma_int_ena));
++}
++
++static void esp32c3_spi2_txrx_buffer(ESP32C3SpiState *s,
++                                     const uint8_t *tx, uint32_t tx_bytes,
++                                     uint8_t *rx, uint32_t rx_bytes)
++{
++    const uint32_t bytes = MAX(tx_bytes, rx_bytes);
++
++    for (uint32_t i = 0; i < bytes; ++i) {
++        uint8_t byte = 0;
++        if (i < tx_bytes) {
++            byte = tx[i];
++        }
++        uint32_t result = ssi_transfer(s->spi, byte);
++        if (i < rx_bytes && rx != NULL) {
++            rx[i] = result & 0xff;
++        }
++    }
++}
++
++static void esp32c3_spi2_dummy_cycles(ESP32C3SpiState *s, uint32_t cycles)
++{
++    const uint32_t bytes = (cycles + 7) / 8;
++    for (uint32_t i = 0; i < bytes; ++i) {
++        ssi_transfer(s->spi, 0);
++    }
++}
++
++static void esp32c3_spi2_begin_transaction(ESP32C3SpiState *s)
++{
++    const uint32_t command_bits = (s->spi2_user2 >> 28) & 0xf;
++    const uint32_t command_bytes = (command_bits + 1) / 8;
++    const uint32_t addr_bits = (s->spi2_user1 >> 27) & 0x1f;
++    const uint32_t addr_bytes = (addr_bits + 1) / 8;
++    const uint32_t data_bits = s->spi2_ms_dlen & 0x3ffff;
++    const uint32_t data_bytes = (data_bits + 1) / 8;
++    const bool dma_tx = (s->spi2_dma_conf & ESP32C3_SPI2_DMA_TX_ENA) != 0;
++    const bool has_command = (s->spi2_user & ESP32C3_SPI2_USR_COMMAND) != 0;
++    const bool has_addr = (s->spi2_user & ESP32C3_SPI2_USR_ADDR) != 0;
++    const bool has_dummy = (s->spi2_user & ESP32C3_SPI2_USR_DUMMY) != 0;
++    const bool has_mosi = (s->spi2_user & ESP32C3_SPI2_USR_MOSI) != 0;
++    const bool has_miso = (s->spi2_user & ESP32C3_SPI2_USR_MISO) != 0;
++    uint8_t *data = NULL;
++    uint32_t dma_chan = 0;
++    bool dma_ok = false;
++
++    if (esp32c3_spi2_trace_count < SPI2_TRACE_LIMIT) {
++        vaddr pc = current_cpu && current_cpu->cc->get_pc
++            ? current_cpu->cc->get_pc(current_cpu) : 0;
++        fprintf(stderr,
++                "[ESP32-C3 SPI2 TRACE] TX pc=0x%08llx cmd=0x%08x cmd_bytes=%u addr=0x%08x addr_bytes=%u data_bytes=%u user=0x%08x dma=0x%08x\n",
++                (unsigned long long)pc, s->spi2_user2 & 0xffff,
++                command_bytes, s->spi2_addr, addr_bytes, data_bytes,
++                s->spi2_user, s->spi2_dma_conf);
++        esp32c3_spi2_trace_count++;
++    }
++
++    if (has_mosi || has_miso) {
++        data = g_malloc0(MAX(data_bytes, 1u));
++    }
++
++    if (has_mosi && data_bytes > 0) {
++        if (dma_tx && s->gdma &&
++            esp_gdma_get_channel_periph(s->gdma, GDMA_SPI2,
++                                         ESP_GDMA_OUT_IDX, &dma_chan)) {
++            dma_ok = esp_gdma_read_channel(s->gdma, dma_chan, data, data_bytes);
++        }
++        if (!dma_ok) {
++            memcpy(data, s->spi2_data_reg,
++                   MIN(data_bytes, sizeof(s->spi2_data_reg)));
++        }
++        if (esp32c3_spi2_trace_count < SPI2_TRACE_LIMIT) {
++            fprintf(stderr,
++                    "[ESP32-C3 SPI2 DATA] dma_ok=%d bytes=%u first=%02x%02x%02x%02x\n",
++                    dma_ok, data_bytes,
++                    data[0],
++                    data_bytes > 1 ? data[1] : 0,
++                    data_bytes > 2 ? data[2] : 0,
++                    data_bytes > 3 ? data[3] : 0);
++        }
++    }
++
++    qemu_set_irq(s->cs_gpio[0], 0);
++
++    if (has_command && command_bytes > 0 && command_bytes <= sizeof(uint32_t)) {
++        uint32_t command = s->spi2_user2 & 0xffff;
++        esp32c3_spi2_txrx_buffer(s, (const uint8_t *)&command,
++                                 command_bytes, NULL, 0);
++    }
++
++    if (has_addr && addr_bytes > 0 && addr_bytes <= sizeof(uint32_t)) {
++        uint32_t address = bswap32(s->spi2_addr);
++        address >>= 32 - addr_bytes * 8;
++        esp32c3_spi2_txrx_buffer(s, (const uint8_t *)&address,
++                                 addr_bytes, NULL, 0);
++    }
++
++    if (has_dummy) {
++        esp32c3_spi2_dummy_cycles(s, s->spi2_user1 & 0xff);
++    }
++
++    if (has_mosi || has_miso) {
++        esp32c3_spi2_txrx_buffer(s, data, has_mosi ? data_bytes : 0,
++                                 data, has_miso ? data_bytes : 0);
++        if (has_miso) {
++            if ((s->spi2_dma_conf & BIT(27)) && s->gdma &&
++                esp_gdma_get_channel_periph(s->gdma, GDMA_SPI2,
++                                             ESP_GDMA_IN_IDX, &dma_chan)) {
++                esp_gdma_write_channel(s->gdma, dma_chan, data, data_bytes);
++            } else {
++                memcpy(s->spi2_data_reg, data,
++                       MIN(data_bytes, sizeof(s->spi2_data_reg)));
++            }
++        }
++    }
++
++    qemu_set_irq(s->cs_gpio[0], 1);
++
++    s->spi2_cmd &= ~ESP32C3_SPI2_USR;
++    s->spi2_dma_int_raw |= ESP32C3_SPI2_TRANS_DONE;
++    if (dma_tx) {
++        s->spi2_dma_int_raw |= ESP32C3_SPI2_SEG_TRANS_DONE;
++    }
++    esp32c3_spi2_update_irq(s);
++    g_free(data);
++}
++
++static uint64_t esp32c3_spi2_read(void *opaque, hwaddr addr,
++                                   unsigned int size)
++{
++    ESP32C3SpiState *s = ESP32C3_SPI(opaque);
++
++    switch (addr) {
++    case ESP32C3_SPI2_CMD:
++        return s->spi2_cmd;
++    case ESP32C3_SPI2_ADDR:
++        return s->spi2_addr;
++    case ESP32C3_SPI2_CTRL:
++        return s->spi2_ctrl;
++    case ESP32C3_SPI2_CLOCK:
++        return s->spi2_clock;
++    case ESP32C3_SPI2_USER:
++        return s->spi2_user;
++    case ESP32C3_SPI2_USER1:
++        return s->spi2_user1;
++    case ESP32C3_SPI2_USER2:
++        return s->spi2_user2;
++    case ESP32C3_SPI2_MS_DLEN:
++        return s->spi2_ms_dlen;
++    case ESP32C3_SPI2_MISC:
++        return s->spi2_misc;
++    case ESP32C3_SPI2_DMA_CONF:
++        return s->spi2_dma_conf;
++    case ESP32C3_SPI2_DMA_INT_ENA:
++        return s->spi2_dma_int_ena;
++    case ESP32C3_SPI2_DMA_INT_CLR:
++        return 0;
++    case ESP32C3_SPI2_DMA_INT_RAW:
++        return s->spi2_dma_int_raw;
++    case ESP32C3_SPI2_DMA_INT_ST:
++        return s->spi2_dma_int_raw & s->spi2_dma_int_ena;
++    case ESP32C3_SPI2_W0 ... ESP32C3_SPI2_W15:
++        return s->spi2_data_reg[(addr - ESP32C3_SPI2_W0) / sizeof(uint32_t)];
++    default:
++        return 0;
++    }
++}
++
++static void esp32c3_spi2_write(void *opaque, hwaddr addr,
++                                uint64_t value, unsigned int size)
++{
++    ESP32C3SpiState *s = ESP32C3_SPI(opaque);
++    const uint32_t wvalue = value;
++
++    if (esp32c3_spi2_trace_count < SPI2_TRACE_LIMIT) {
++        vaddr pc = current_cpu && current_cpu->cc->get_pc
++            ? current_cpu->cc->get_pc(current_cpu) : 0;
++        fprintf(stderr,
++                "[ESP32-C3 SPI2 TRACE] W pc=0x%08llx off=0x%03llx size=%u value=0x%08x\n",
++                (unsigned long long)pc, (unsigned long long)addr, size,
++                wvalue);
++        esp32c3_spi2_trace_count++;
++    }
++
++    switch (addr) {
++    case ESP32C3_SPI2_CMD:
++        s->spi2_cmd = wvalue;
++        if (wvalue & ESP32C3_SPI2_UPDATE) {
++            /* The real GPSPI2 synchronizes the APB-side configuration into
++             * the SPI clock domain and clears UPDATE when that completes.
++             * ESP-IDF immediately polls this bit after every configuration
++             * change, so the emulation must complete the handshake here. */
++            s->spi2_cmd &= ~ESP32C3_SPI2_UPDATE;
++        }
++        if (wvalue & ESP32C3_SPI2_SOFT_RESET) {
++            s->spi2_cmd &= ~ESP32C3_SPI2_SOFT_RESET;
++            s->spi2_dma_int_raw = 0;
++        }
++        if (wvalue & ESP32C3_SPI2_USR) {
++            esp32c3_spi2_begin_transaction(s);
++        }
++        break;
++    case ESP32C3_SPI2_ADDR:
++        s->spi2_addr = wvalue;
++        break;
++    case ESP32C3_SPI2_CTRL:
++        s->spi2_ctrl = wvalue;
++        break;
++    case ESP32C3_SPI2_CLOCK:
++        s->spi2_clock = wvalue;
++        break;
++    case ESP32C3_SPI2_USER:
++        s->spi2_user = wvalue;
++        break;
++    case ESP32C3_SPI2_USER1:
++        s->spi2_user1 = wvalue;
++        break;
++    case ESP32C3_SPI2_USER2:
++        s->spi2_user2 = wvalue;
++        break;
++    case ESP32C3_SPI2_MS_DLEN:
++        s->spi2_ms_dlen = wvalue;
++        break;
++    case ESP32C3_SPI2_MISC:
++        s->spi2_misc = wvalue;
++        break;
++    case ESP32C3_SPI2_DMA_CONF:
++        s->spi2_dma_conf = wvalue;
++        break;
++    case ESP32C3_SPI2_DMA_INT_ENA:
++        s->spi2_dma_int_ena = wvalue;
++        esp32c3_spi2_update_irq(s);
++        break;
++    case ESP32C3_SPI2_DMA_INT_CLR:
++        s->spi2_dma_int_raw &= ~wvalue;
++        esp32c3_spi2_update_irq(s);
++        break;
++    case ESP32C3_SPI2_DMA_INT_RAW:
++        s->spi2_dma_int_raw = wvalue;
++        esp32c3_spi2_update_irq(s);
++        break;
++    case ESP32C3_SPI2_W0 ... ESP32C3_SPI2_W15:
++        s->spi2_data_reg[(addr - ESP32C3_SPI2_W0) / sizeof(uint32_t)] = wvalue;
++        break;
++    default:
++        break;
++    }
++}
++
+ 
+ static uint64_t esp32c3_spi_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+     ESP32C3SpiState *s = ESP32C3_SPI(opaque);
+ 
++    if (s->is_spi2) {
++        return esp32c3_spi2_read(opaque, addr, size);
++    }
++
+     uint64_t r = 0;
+     switch (addr) {
+         case A_SPI_MEM_CMD:
+@@ -127,11 +390,11 @@ static void esp32c3_spi_txrx_buffer(ESP32C3SpiState *s,
+     int bytes = MAX(tx_bytes, rx_bytes);
+     for (int i = 0; i < bytes; ++i) {
+         uint8_t byte = 0;
+-        if (byte < tx_bytes) {
++        if (i < tx_bytes) {
+             memcpy(&byte, tx + i, 1);
+         }
+         uint32_t res = ssi_transfer(s->spi, byte);
+-        if (byte < rx_bytes) {
++        if (i < rx_bytes) {
+             memcpy(rx + i, &res, 1);
+         }
+     }
+@@ -145,6 +408,14 @@ static void esp32c3_spi_dummy_cycles(ESP32C3SpiState *s, uint32_t dummy_bytes) {
+ 
+ static void esp32c3_spi_perform_transaction(ESP32C3SpiState *s, ESP32C3SpiTransaction *t)
+ {
++    if (esp32c3_spi1_trace_count < SPI1_TRACE_LIMIT) {
++        fprintf(stderr,
++                "[ESP32-C3 SPI1 TRACE] cmd=0x%02x addr=0x%08x addr_bytes=%u dummy=%u tx=%u rx=%u user=0x%08x user1=0x%08x user2=0x%08x\\n",
++                t->cmd, t->addr, t->addr_bytes, t->dummy_bytes,
++                t->tx_bytes, t->rx_bytes, s->mem_user, s->mem_user1,
++                s->mem_user2);
++        esp32c3_spi1_trace_count++;
++    }
+     if (s->xts_aes != NULL)
+     {
+         ESP32C3XtsAesClass *xts_aes_class = ESP32C3_XTS_AES_GET_CLASS(s->xts_aes);
+@@ -159,6 +430,18 @@ static void esp32c3_spi_perform_transaction(ESP32C3SpiState *s, ESP32C3SpiTransa
+     esp32c3_spi_txrx_buffer(s, &t->addr, t->addr_bytes, NULL, 0);
+     esp32c3_spi_dummy_cycles(s, t->dummy_bytes);
+     esp32c3_spi_txrx_buffer(s, t->data, t->tx_bytes, t->data, t->rx_bytes);
++    if (t->rx_bytes > 0 && t->data != NULL &&
++        esp32c3_spi1_trace_count < SPI1_TRACE_LIMIT) {
++        const uint8_t *bytes = (const uint8_t *)t->data;
++        fprintf(stderr,
++                "[ESP32-C3 SPI1 DATA] rx=%u first=%02x%02x%02x%02x\\n",
++                t->rx_bytes,
++                bytes[0],
++                t->rx_bytes > 1 ? bytes[1] : 0,
++                t->rx_bytes > 2 ? bytes[2] : 0,
++                t->rx_bytes > 3 ? bytes[3] : 0);
++        esp32c3_spi1_trace_count++;
++    }
+     qemu_set_irq(s->cs_gpio[0], 1);
+ }
+ 
+@@ -339,6 +622,11 @@ static void esp32c3_spi_write(void *opaque, hwaddr addr,
+     ESP32C3SpiState *s = ESP32C3_SPI(opaque);
+     uint32_t wvalue = (uint32_t) value;
+ 
++    if (s->is_spi2) {
++        esp32c3_spi2_write(opaque, addr, value, size);
++        return;
++    }
++
+ #if SPI1_DEBUG
+     info_report("[SPI1] Writing 0x%lx = %08lx", addr, value);
+ #endif
+@@ -410,6 +698,19 @@ static void esp32c3_spi_reset_hold(Object *obj, ResetType type)
+ {
+     ESP32C3SpiState *s = ESP32C3_SPI(obj);
+     memset(s->data_reg, 0, ESP32C3_SPI_BUF_WORDS * sizeof(uint32_t));
++    memset(s->spi2_data_reg, 0, ESP32C3_SPI_BUF_WORDS * sizeof(uint32_t));
++    s->spi2_cmd = 0;
++    s->spi2_addr = 0;
++    s->spi2_ctrl = 0;
++    s->spi2_clock = 0;
++    s->spi2_user = 0;
++    s->spi2_user1 = 0;
++    s->spi2_user2 = 0;
++    s->spi2_ms_dlen = 0;
++    s->spi2_misc = 0;
++    s->spi2_dma_conf = 0;
++    s->spi2_dma_int_ena = 0;
++    s->spi2_dma_int_raw = 0;
+     s->mem_ctrl1 = FIELD_DP32(s->mem_ctrl1, SPI_MEM_CTRL1, CS_HOLD_DLY_RES, 0x3ff);
+     s->mem_clock = FIELD_DP32(s->mem_clock, SPI_MEM_CLOCK, CLKCNT_N, 3);
+     s->mem_clock = FIELD_DP32(s->mem_clock, SPI_MEM_CLOCK, CLKCNT_H, 1);
+@@ -451,6 +752,7 @@ static void esp32c3_spi_init(Object *obj)
+ 
+     s->spi = ssi_create_bus(DEVICE(s), "spi");
+     qdev_init_gpio_out_named(DEVICE(s), &s->cs_gpio[0], SSI_GPIO_CS, ESP32C3_SPI_CS_COUNT);
++    sysbus_init_irq(sbd, &s->irq);
+ }
+ 
+ static Property esp32c3_spi_properties[] = {
+diff --git a/include/hw/display/st7789.h b/include/hw/display/st7789.h
+new file mode 100644
+index 0000000..ebd1bad
+--- /dev/null
++++ b/include/hw/display/st7789.h
+@@ -0,0 +1,41 @@
++#pragma once
++
++#include "hw/ssi/ssi.h"
++
++#define TYPE_ST7789 "st7789"
++OBJECT_DECLARE_SIMPLE_TYPE(ST7789State, ST7789)
++
++#define ST7789_WIDTH  240
++#define ST7789_HEIGHT 320
++#define ST7789_FRAME_BYTES (ST7789_WIDTH * ST7789_HEIGHT * 2)
++
++struct ST7789State {
++    SSIPeripheral parent_obj;
++
++    qemu_irq dc;
++    bool dc_level;
++    uint8_t current_command;
++    uint8_t command_data[4];
++    uint8_t command_data_len;
++    uint16_t column_start;
++    uint16_t column_end;
++    uint16_t row_start;
++    uint16_t row_end;
++    uint16_t current_x;
++    uint16_t current_y;
++    uint8_t madctl;
++    uint8_t colmod;
++    bool display_on;
++    bool invert_color;
++    bool ramwr_active;
++    bool pending_pixel_high;
++    uint8_t pending_pixel;
++    uint32_t pixel_count;
++    uint32_t window_pixel_count;
++    bool window_complete;
++    int64_t last_frame_ms;
++    uint64_t frame_revision;
++    bool emitted_frame_valid;
++    uint8_t emitted_framebuffer[ST7789_FRAME_BYTES];
++    uint8_t framebuffer[ST7789_FRAME_BYTES];
++};
+diff --git a/include/hw/dma/esp_gdma.h b/include/hw/dma/esp_gdma.h
+index d555249..a7bf3c2 100644
+--- a/include/hw/dma/esp_gdma.h
++++ b/include/hw/dma/esp_gdma.h
+@@ -156,7 +156,15 @@ bool esp_gdma_get_channel_periph(ESPGdmaState *s, GdmaPeripheral periph, int dir
+                                      uint32_t* chan);
+ 
+ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint32_t size);
++/* Service exactly the current OUT descriptor.  Peripheral models that expose
++ * descriptor-level EOF interrupts (for example I2S) use this instead of
++ * consuming an arbitrary byte quantum and crossing into guest-owned rings. */
++bool esp_gdma_read_channel_one(ESPGdmaState *s, uint32_t chan, uint8_t* buffer,
++                               uint32_t size, uint32_t *transferred);
+ bool esp_gdma_write_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint32_t size);
++/* Service exactly the current IN descriptor for peripheral-to-memory DMA. */
++bool esp_gdma_write_channel_one(ESPGdmaState *s, uint32_t chan, uint8_t* buffer,
++                                uint32_t size);
+ 
+ 
+ /**
+diff --git a/include/hw/gpio/esp32_gpio.h b/include/hw/gpio/esp32_gpio.h
+index 163b41a..c68fadc 100644
+--- a/include/hw/gpio/esp32_gpio.h
++++ b/include/hw/gpio/esp32_gpio.h
+@@ -14,12 +14,25 @@ REG32(GPIO_STRAP, 0x0038)
+ #define ESP32_STRAP_MODE_FLASH_BOOT 0x12
+ #define ESP32_STRAP_MODE_UART_BOOT  0x0f
+ 
++#define ESP32_GPIO_PIN_COUNT 26
++#define ESP32_GPIO_OUT_REG 0x04
++#define ESP32_GPIO_OUT_W1TS_REG 0x08
++#define ESP32_GPIO_OUT_W1TC_REG 0x0c
++#define ESP32_GPIO_ENABLE_REG 0x20
++#define ESP32_GPIO_ENABLE_W1TS_REG 0x24
++#define ESP32_GPIO_ENABLE_W1TC_REG 0x28
++#define ESP32_GPIO_IN_REG 0x3c
++
+ typedef struct Esp32GpioState {
+     SysBusDevice parent_obj;
+ 
+     MemoryRegion iomem;
+     qemu_irq irq;
+     uint32_t strap_mode;
++    uint32_t gpio_out;
++    uint32_t gpio_enable;
++    uint32_t gpio_in;
++    qemu_irq gpio_out_lines[ESP32_GPIO_PIN_COUNT];
+ } Esp32GpioState;
+ 
+ typedef struct Esp32GpioClass {
+diff --git a/include/hw/gpio/esp32c3_gpio.h b/include/hw/gpio/esp32c3_gpio.h
+index 6fe8b72..af5b55d 100644
+--- a/include/hw/gpio/esp32c3_gpio.h
++++ b/include/hw/gpio/esp32c3_gpio.h
+@@ -21,4 +21,7 @@ typedef struct ESP32C3State {
+ 
+ typedef struct ESP32C3GPIOClass {
+     Esp32GpioClass parent;
++    /* Keep the parent reset implementation so the C3 board can restore its
++     * external GPIO0 pull-up after every reset. */
++    ResettablePhases parent_phases;
+ } ESP32C3GPIOClass;
+diff --git a/include/hw/i2c/esp32_i2c.h b/include/hw/i2c/esp32_i2c.h
+index b17dc75..c65f1f5 100644
+--- a/include/hw/i2c/esp32_i2c.h
++++ b/include/hw/i2c/esp32_i2c.h
+@@ -99,10 +99,11 @@ REG32(I2C_CMD, 0x58);
+ 
+ /* I2C_CMD.OPCODE values */
+ typedef enum {
+-    I2C_OPCODE_RSTART = 0,
++    /* ESP32-C3 uses the GP-I2C command encoding from the IDF LL layer. */
++    I2C_OPCODE_RSTART = 6,
+     I2C_OPCODE_WRITE  = 1,
+-    I2C_OPCODE_READ   = 2,
+-    I2C_OPCODE_STOP   = 3,
++    I2C_OPCODE_READ   = 3,
++    I2C_OPCODE_STOP   = 2,
+     I2C_OPCODE_END    = 4,
+ } i2c_opcode_t;
+ 
+diff --git a/include/hw/i2c/esp32_i2c_devices.h b/include/hw/i2c/esp32_i2c_devices.h
+new file mode 100644
+index 0000000..44238b1
+--- /dev/null
++++ b/include/hw/i2c/esp32_i2c_devices.h
+@@ -0,0 +1,14 @@
++#pragma once
++
++#include "hw/i2c/i2c.h"
++
++#define TYPE_ESP32_I2C_PERIPHERAL "esp32.i2c-peripheral"
++OBJECT_DECLARE_SIMPLE_TYPE(Esp32I2CPeripheral, ESP32_I2C_PERIPHERAL)
++
++struct Esp32I2CPeripheral {
++    I2CSlave parent_obj;
++
++    uint8_t registers[256];
++    uint8_t register_pointer;
++    bool expect_register;
++};
+diff --git a/include/hw/misc/esp32c3_jtag.h b/include/hw/misc/esp32c3_jtag.h
+index 8ac6ebb..f8df1b6 100644
+--- a/include/hw/misc/esp32c3_jtag.h
++++ b/include/hw/misc/esp32c3_jtag.h
+@@ -18,9 +18,39 @@
+ 
+ #define ESP32C3_JTAG_REGS_SIZE (0x84)
+ 
++#define ESP32C3_JTAG_EP1_REG       0x00
++#define ESP32C3_JTAG_EP1_CONF_REG  0x04
++#define ESP32C3_JTAG_INT_RAW_REG   0x08
++#define ESP32C3_JTAG_INT_ST_REG    0x0c
++#define ESP32C3_JTAG_INT_ENA_REG   0x10
++#define ESP32C3_JTAG_INT_CLR_REG   0x14
++#define ESP32C3_JTAG_CONF0_REG     0x18
++#define ESP32C3_JTAG_TEST_REG      0x1c
++#define ESP32C3_JTAG_JFIFO_ST_REG  0x20
++#define ESP32C3_JTAG_MISC_CONF_REG 0x44
++#define ESP32C3_JTAG_MEM_CONF_REG  0x48
++
++#define ESP32C3_JTAG_RDWR_BYTE_MASK        0xffu
++#define ESP32C3_JTAG_WR_DONE               BIT(0)
++#define ESP32C3_JTAG_SERIAL_IN_DATA_FREE   BIT(1)
++#define ESP32C3_JTAG_SERIAL_OUT_DATA_AVAIL BIT(2)
++#define ESP32C3_JTAG_INTR_SERIAL_IN_EMPTY  BIT(3)
++
+ 
+ typedef struct ESP32C3UsbJtagState {
+     SysBusDevice parent_object;
+     MemoryRegion iomem;
+-} ESP32C3UsbJtagState;
+ 
++    uint32_t int_raw;
++    uint32_t int_ena;
++    uint32_t conf0;
++    uint32_t test;
++    uint32_t jfifo_st;
++    uint32_t misc_conf;
++    uint32_t mem_conf;
++
++    uint8_t tx_fifo[64];
++    uint32_t tx_fifo_len;
++    uint8_t rx_byte;
++    bool rx_data_available;
++} ESP32C3UsbJtagState;
+diff --git a/include/hw/riscv/esp32c3_clk.h b/include/hw/riscv/esp32c3_clk.h
+index 5701606..99b5af3 100644
+--- a/include/hw/riscv/esp32c3_clk.h
++++ b/include/hw/riscv/esp32c3_clk.h
+@@ -48,6 +48,12 @@ typedef struct ESP32C3ClockState {
+     /* Registers for clocks configuration and frequency dividers */
+     uint32_t cpuperconf;
+     uint32_t sysclk;
++    uint32_t perip_clk_en0;
++    uint32_t perip_clk_en1;
++    uint32_t perip_rst_en0;
++    uint32_t perip_rst_en1;
++    uint32_t bt_lpck_div_int;
++    uint32_t bt_lpck_div_frac;
+ 
+ 
+     /* IRQs for crosscore interrupts */
+@@ -64,4 +70,3 @@ typedef struct ESP32C3ClockClass {
+     /* Virtual methods */
+     uint32_t (*get_ext_dev_enc_dec_ctrl)(ESP32C3ClockState *s);
+ } ESP32C3ClockClass;
+-
+diff --git a/include/hw/riscv/esp32c3_clk_defs.h b/include/hw/riscv/esp32c3_clk_defs.h
+index 9b5ec60..623b3be 100644
+--- a/include/hw/riscv/esp32c3_clk_defs.h
++++ b/include/hw/riscv/esp32c3_clk_defs.h
+@@ -30,7 +30,7 @@ REG32(SYSTEM_CPU_PER_CONF, 0x008)
+ REG32(SYSTEM_MEM_PD_MASK, 0x00C)
+     FIELD(SYSTEM_MEM_PD_MASK, LSLP_MEM_PD_MASK, 0, 1)
+ 
+-REG32(SYSTEM_PERIP_CLK_EN0, 0x010)
++REG32(SYSTEM_PERIP_CLK_EN0, 0x010)
+     FIELD(SYSTEM_PERIP_CLK_EN0, SPI4_CLK_EN, 31, 1)
+     FIELD(SYSTEM_PERIP_CLK_EN0, ADC2_ARB_CLK_EN, 30, 1)
+     FIELD(SYSTEM_PERIP_CLK_EN0, SYSTIMER_CLK_EN, 29, 1)
+@@ -62,9 +62,9 @@ REG32(SYSTEM_PERIP_CLK_EN0, 0x010)
+     FIELD(SYSTEM_PERIP_CLK_EN0, WDG_CLK_EN, 3, 1)
+     FIELD(SYSTEM_PERIP_CLK_EN0, UART_CLK_EN, 2, 1)
+     FIELD(SYSTEM_PERIP_CLK_EN0, SPI01_CLK_EN, 1, 1)
+-    FIELD(SYSTEM_PERIP_CLK_EN0, TIMERS_CLK_EN, 0, 1)
+-
+-REG32(SYSTEM_PERIP_CLK_EN1, 0x014)
++    FIELD(SYSTEM_PERIP_CLK_EN0, TIMERS_CLK_EN, 0, 1)
++
++REG32(SYSTEM_PERIP_CLK_EN1, 0x014)
+     FIELD(SYSTEM_PERIP_CLK_EN1, TSENS_CLK_EN, 10, 1)
+     FIELD(SYSTEM_PERIP_CLK_EN1, UART2_CLK_EN, 9, 1)
+     FIELD(SYSTEM_PERIP_CLK_EN1, LCD_CAM_CLK_EN, 8, 1)
+diff --git a/include/hw/ssi/esp32c3_spi.h b/include/hw/ssi/esp32c3_spi.h
+index 3a6e666..2edc1e1 100644
+--- a/include/hw/ssi/esp32c3_spi.h
++++ b/include/hw/ssi/esp32c3_spi.h
+@@ -3,6 +3,7 @@
+ #include "hw/hw.h"
+ #include "hw/registerfields.h"
+ #include "hw/misc/esp32c3_xts_aes.h"
++#include "hw/dma/esp_gdma.h"
+ #include "hw/ssi/ssi.h"
+ 
+ #define TYPE_ESP32C3_SPI "ssi.esp32c3.spi"
+@@ -18,6 +19,38 @@
+ 
+ #define ESP32C3_SPI_CS_COUNT 3
+ 
++/* ESP32-C3 GPSPI2 uses the newer GP-SPI register layout.  SPI1 keeps the
++ * memory-controller layout above because it is used by the boot ROM for the
++ * external flash. */
++#define ESP32C3_SPI2_CMD             0x000
++#define ESP32C3_SPI2_ADDR            0x004
++#define ESP32C3_SPI2_CTRL            0x008
++#define ESP32C3_SPI2_CLOCK           0x00C
++#define ESP32C3_SPI2_USER            0x010
++#define ESP32C3_SPI2_USER1           0x014
++#define ESP32C3_SPI2_USER2           0x018
++#define ESP32C3_SPI2_MS_DLEN         0x01C
++#define ESP32C3_SPI2_MISC            0x020
++#define ESP32C3_SPI2_DMA_CONF        0x030
++#define ESP32C3_SPI2_DMA_INT_ENA     0x034
++#define ESP32C3_SPI2_DMA_INT_CLR     0x038
++#define ESP32C3_SPI2_DMA_INT_RAW     0x03C
++#define ESP32C3_SPI2_DMA_INT_ST      0x040
++#define ESP32C3_SPI2_W0              0x098
++#define ESP32C3_SPI2_W15             0x0D4
++
++#define ESP32C3_SPI2_USR             BIT(24)
++#define ESP32C3_SPI2_UPDATE          BIT(23)
++#define ESP32C3_SPI2_SOFT_RESET      BIT(27)
++#define ESP32C3_SPI2_USR_COMMAND     BIT(31)
++#define ESP32C3_SPI2_USR_ADDR        BIT(30)
++#define ESP32C3_SPI2_USR_DUMMY       BIT(29)
++#define ESP32C3_SPI2_USR_MISO        BIT(28)
++#define ESP32C3_SPI2_USR_MOSI        BIT(27)
++#define ESP32C3_SPI2_DMA_TX_ENA      BIT(28)
++#define ESP32C3_SPI2_TRANS_DONE      BIT(12)
++#define ESP32C3_SPI2_SEG_TRANS_DONE  BIT(13)
++
+ typedef struct ESP32C3SpiState {
+     SysBusDevice parent_obj;
+ 
+@@ -45,6 +78,24 @@ typedef struct ESP32C3SpiState {
+     uint32_t data_reg[ESP32C3_SPI_BUF_WORDS];
+     uint32_t mem_sus_st;
+     ESP32C3XtsAesState *xts_aes;
++
++    bool is_spi2;
++    ESPGdmaState *gdma;
++    qemu_irq irq;
++
++    uint32_t spi2_cmd;
++    uint32_t spi2_addr;
++    uint32_t spi2_ctrl;
++    uint32_t spi2_clock;
++    uint32_t spi2_user;
++    uint32_t spi2_user1;
++    uint32_t spi2_user2;
++    uint32_t spi2_ms_dlen;
++    uint32_t spi2_misc;
++    uint32_t spi2_dma_conf;
++    uint32_t spi2_dma_int_ena;
++    uint32_t spi2_dma_int_raw;
++    uint32_t spi2_data_reg[ESP32C3_SPI_BUF_WORDS];
+ } ESP32C3SpiState;
+ 
+ 
+diff --git a/target/riscv/pmp.c b/target/riscv/pmp.c
+index a1b3666..5500c0f 100644
+--- a/target/riscv/pmp.c
++++ b/target/riscv/pmp.c
+@@ -308,11 +308,42 @@ bool pmp_hart_has_privs(CPURISCVState *env, hwaddr addr,
+                         target_ulong size, pmp_priv_t privs,
+                         pmp_priv_t *allowed_privs, target_ulong mode)
+ {
++    static bool esp32c3_probe_logged;
+     int i = 0;
+     int pmp_size = 0;
+     hwaddr s = 0;
+     hwaddr e = 0;
+ 
++    /* ESP32-C3 ROM/BT compatibility window.  The ROM image shipped with
++     * Espressif's QEMU package still uses the legacy 0x3fc00000 scratch
++     * alias, while the application PMP table describes the whole range
++     * below 0x3fc80000 as execute-only.  Real C3 silicon exposes this
++     * controller scratch window as writable; allow the exact window here
++     * while preserving the generic PMP behavior everywhere else. */
++    if (addr >= 0x3fc00000 && addr < 0x3fc08000 &&
++        addr + (size ? size : 1) <= 0x3fc08000 && mode == PRV_M &&
++        (privs & PMP_WRITE)) {
++        *allowed_privs = PMP_READ | PMP_WRITE | PMP_EXEC;
++        return true;
++    }
++
++    if (!esp32c3_probe_logged && addr >= 0x3fbf0000 && addr < 0x3fc10000) {
++        esp32c3_probe_logged = true;
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "PMP probe addr=0x%08" HWADDR_PRIx " size=%" PRIu64
++                      " privs=0x%x mode=%" PRIu64 " rules=%u\n",
++                      addr, (uint64_t)size, privs, (uint64_t)mode,
++                      pmp_get_num_rules(env));
++        for (int j = 0; j < MAX_RISCV_PMPS; ++j) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "PMP[%d] cfg=0x%02x addr=0x%08" PRIx64
++                          " range=0x%08" HWADDR_PRIx "..0x%08" HWADDR_PRIx "\n",
++                          j, env->pmp_state.pmp[j].cfg_reg,
++                          (uint64_t)env->pmp_state.pmp[j].addr_reg,
++                          env->pmp_state.addr[j].sa, env->pmp_state.addr[j].ea);
++        }
++    }
++
+     /* Short cut if no rules */
+     if (0 == pmp_get_num_rules(env)) {
+         return pmp_hart_has_privs_default(env, privs, allowed_privs, mode);

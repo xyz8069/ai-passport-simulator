@@ -1,0 +1,21 @@
+# Official Espressif QEMU release assets (upstream, unmodified)
+# Release tag: esp-develop-9.2.2-20260417
+# https://github.com/espressif/qemu/releases/tag/esp-develop-9.2.2-20260417
+#
+# Note: the upstream release boots real ESP32-C3 firmware and provides serial
+# logs, but it does NOT include the AI Passport display/input bridges. For the
+# full framebuffer experience use the project's own QEMU build (see README).
+# qemu-riscv32-softmmu-esp_develop_9.2.2_20260417-aarch64-apple-darwin.tar.xz: 3763728 bytes
+67bff66ff7158f272ce167fc211c0f8f4c1a79b6f6174350678a6d5035644b30 *qemu-riscv32-softmmu-esp_develop_9.2.2_20260417-aarch64-apple-darwin.tar.xz
+# qemu-riscv32-softmmu-esp_develop_9.2.2_20260417-x86_64-linux-gnu.tar.xz: 16842920 bytes
+547f03e04701a92cbb699f7f7d015adc1f5b5ef93cbb94c0dd9b7107e2d84e77 *qemu-riscv32-softmmu-esp_develop_9.2.2_20260417-x86_64-linux-gnu.tar.xz
+# qemu-riscv32-softmmu-esp_develop_9.2.2_20260417-aarch64-linux-gnu.tar.xz: 16325180 bytes
+a9f7b98636008edcf7a11c96f10b3a3ec83c2a890fc54c3e3ceb3ec9edace427 *qemu-riscv32-softmmu-esp_develop_9.2.2_20260417-aarch64-linux-gnu.tar.xz
+# qemu-xtensa-softmmu-esp_develop_9.2.2_20260417-aarch64-apple-darwin.tar.xz: 3867936 bytes
+bb8c15810565d3df1665dc34962430885e11bc95575b228fb44698146be1e9d6 *qemu-xtensa-softmmu-esp_develop_9.2.2_20260417-aarch64-apple-darwin.tar.xz
+# qemu-xtensa-softmmu-esp_develop_9.2.2_20260417-x86_64-apple-darwin.tar.xz: 3870980 bytes
+ae8170fe46bcdfa54a7c0d7afcdb7a066711991be680f72ff7bbc6c4ae3ad88f *qemu-xtensa-softmmu-esp_develop_9.2.2_20260417-x86_64-apple-darwin.tar.xz
+# qemu-xtensa-softmmu-esp_develop_9.2.2_20260417-x86_64-linux-gnu.tar.xz: 15619396 bytes
+0eecb2a34a5586c0e59110f77b9343b7b336e82fdb0e1a30e1dc1bab8a547e35 *qemu-xtensa-softmmu-esp_develop_9.2.2_20260417-x86_64-linux-gnu.tar.xz
+# qemu-xtensa-softmmu-esp_develop_9.2.2_20260417-aarch64-linux-gnu.tar.xz: 15111492 bytes
+00de5985094c14e47d1b38464a006b8ed64fd0fa7a289c56da24f3a329f65339 *qemu-xtensa-softmmu-esp_develop_9.2.2_20260417-aarch64-linux-gnu.tar.xz

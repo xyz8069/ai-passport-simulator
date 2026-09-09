@@ -1,0 +1,27 @@
+services:
+  simulator:
+    build: .
+    image: ai-passport-simulator:latest
+    container_name: ai-passport-simulator
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # Sign-in-free demo app; the secret only signs Flask session cookies.
+      AI_PASSPORT_SECRET_KEY: "${AI_PASSPORT_SECRET_KEY:-change-me-in-production}"
+    volumes:
+      # Sessions, validated firmware artifacts, snapshots and input logs.
+      - simulator-instance:/app/web/instance
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    # The web process owns one QEMU per active session.  Tune these to your
+    # VPS; 1 GB fits a handful of concurrent visitors.
+    mem_limit: 1g
+    cpus: 2
+
+volumes:
+  simulator-instance:
