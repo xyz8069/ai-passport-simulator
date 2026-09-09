@@ -9,6 +9,9 @@ A browser-based workbench that runs **real** ESP32-C3 firmware for the
 QEMU backend, and forwards the `240×320 RGB565` framebuffer to a
 device-shaped canvas in your browser.
 
+> 🌐 **Live demo**: <http://ai.xinxianjiucai.com:47381> — no local setup
+> needed; upload a firmware or import one from the official plays catalog.
+
 ## Features
 
 - Official device appearance with three virtual buttons (UP / OK / DOWN).
@@ -178,3 +181,9 @@ DEPLOY.md     deployment guide (EN) / 部署指南 (zh_CN)
 
 This project is released under the [MIT License](LICENSE). Third-party
 components remain under their own licenses as noted above.
+
+## Contributing
+
+Issues, stars and forks are all welcome — open an
+[issue](https://github.com/xyz8069/ai-passport-simulator/issues) for bugs or
+ideas, star the project if you find it useful, and fork it to build your own.

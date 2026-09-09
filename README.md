@@ -8,6 +8,9 @@
 的**真实 ESP32-C3 固件**交给可插拔的 QEMU 后端执行，并将真实的
 `240×320 RGB565` framebuffer 转发到浏览器中的设备外观画布上。
 
+> 🌐 **在线体验**：<http://ai.xinxianjiucai.com:47381> ——
+> 无需本地部署，直接上传固件或从官方玩法目录导入运行。
+
 ## 功能
 
 - 官方设备外观与三枚虚拟按键（UP / OK / DOWN）。
@@ -161,3 +164,8 @@ DEPLOY.zh_CN.md  部署指南（中文） / deployment guide (EN)
 ## 许可证
 
 本项目基于 [MIT License](LICENSE) 发布。第三方组件仍遵循上文所述的各自许可证。
+
+## 参与贡献
+
+欢迎提 [Issue](https://github.com/xyz8069/ai-passport-simulator/issues)
+反馈问题或建议，欢迎点 Star 支持项目，也欢迎 Fork 参与开发！
