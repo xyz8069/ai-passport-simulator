@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # ---------------------------------------------------------------------------
 # Stage 1 — build the AI Passport QEMU customization for Linux.
 #
@@ -45,6 +43,11 @@ RUN cd /build/qemu \
 # input bridge are enabled without extra configuration.
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim
+
+# Optional pip mirror for constrained networks, e.g.
+#   docker compose build --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_INDEX_URL=""
+ENV PIP_INDEX_URL=${PIP_INDEX_URL}
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
