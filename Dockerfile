@@ -75,7 +75,7 @@ RUN if [ -n "$APT_MIRROR" ]; then \
         /etc/apt/sources.list 2>/dev/null || true; \
     fi \
  && apt-get update && apt-get install -y --no-install-recommends \
-      libglib2.0-0 libpixman-1-0 zlib1g \
+      libglib2.0-0 libpixman-1-0 zlib1g libgcrypt20 \
     && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 1000 sim
 
