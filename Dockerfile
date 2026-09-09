@@ -41,7 +41,7 @@ RUN cd /build/qemu \
  && ./configure --prefix=/opt/qemu \
       --target-list=riscv32-softmmu --disable-gtk --disable-sdl --disable-vnc \
       --disable-curl --disable-opengl --disable-virglrenderer \
-      --disable-vhost-user --disable-xkbcommon --disable-docs \
+      --disable-vhost-user --disable-slirp --disable-xkbcommon --disable-docs \
       --disable-tools --disable-werror --disable-pie \
       --enable-fdt=internal --enable-plugins \
  && make -j"$(nproc)" \
