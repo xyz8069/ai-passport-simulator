@@ -8,6 +8,9 @@
 FROM ubuntu:24.04 AS qemu-builder
 
 ARG QEMU_BASE_COMMIT=febae182e132e4055529be423a818225ebddaa3a
+# Source snapshot of ${QEMU_BASE_COMMIT}. Override when building on networks
+# without GitHub access, e.g. --build-arg QEMU_SRC_URL=http://172.17.0.1:8001/qemu-src.tar.gz
+ARG QEMU_SRC_URL=https://codeload.github.com/espressif/qemu/tar.gz/${QEMU_BASE_COMMIT}
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -18,8 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 # Download the exact upstream base commit the patch was generated against.
-RUN curl -fsSL -o /tmp/qemu-src.tar.gz \
-      "https://codeload.github.com/espressif/qemu/tar.gz/${QEMU_BASE_COMMIT}" \
+RUN curl -fsSL -o /tmp/qemu-src.tar.gz "${QEMU_SRC_URL}" \
  && tar -xzf /tmp/qemu-src.tar.gz \
  && mv /build/qemu-* /build/qemu
 
