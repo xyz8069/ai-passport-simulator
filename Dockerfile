@@ -43,6 +43,7 @@ RUN cd /build/qemu \
       --disable-curl --disable-opengl --disable-virglrenderer \
       --disable-vhost-user --disable-xkbcommon --disable-docs \
       --disable-tools --disable-werror --disable-pie --disable-guest-agent \
+      --disable-tests LDFLAGS="-no-pie" \
       --enable-fdt=internal --enable-plugins \
  && make -j"$(nproc)" \
  && make install
