@@ -21,7 +21,10 @@ api_bp = Blueprint("api", __name__)
 
 @page_bp.get("/")
 def index():
-    return render_template("index.html")
+    return render_template(
+        "index.html",
+        allow_upload=current_app.config.get("AI_PASSPORT_ALLOW_UPLOAD", True),
+    )
 
 
 def _manager():
@@ -448,6 +451,13 @@ def list_snapshots(session_id: str):
 @api_bp.post("/firmware")
 def upload_firmware():
     """Store and structurally validate one ESP32-C3 .bin image."""
+    if not current_app.config.get("AI_PASSPORT_ALLOW_UPLOAD", True):
+        return jsonify(
+            {
+                "error": "firmware upload is disabled on this instance; "
+                "import a firmware from the official plays catalog instead"
+            }
+        ), 403
     upload = request.files.get("file")
     if upload is None or not upload.filename:
         return jsonify({"error": "multipart field 'file' is required"}), 400

@@ -28,6 +28,12 @@ def create_app(test_config: Optional[dict] = None) -> Flask:
         AI_PASSPORT_FIRMWARE_DIR=str(Path(app.instance_path) / "firmware"),
         AI_PASSPORT_MAX_FIRMWARE_BYTES=8 * 1024 * 1024,
         MAX_CONTENT_LENGTH=8 * 1024 * 1024 + 64 * 1024,
+        # Public demo instances can disable user uploads entirely and keep
+        # only the official plays catalog; self-hosted defaults keep uploads.
+        AI_PASSPORT_ALLOW_UPLOAD=os.environ.get(
+            "AI_PASSPORT_ALLOW_UPLOAD", "1"
+        ).lower()
+        not in {"0", "false", "no"},
         AI_PASSPORT_PLAY_CATALOG_TTL=60,
         AI_PASSPORT_PLAY_CATALOG_TIMEOUT=20,
     )

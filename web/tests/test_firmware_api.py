@@ -415,3 +415,31 @@ def test_speaker_audio_queue_endpoint_delivers_every_frame(client, tmp_path, mon
     missing = client.get(f"/api/firmware/99999/audio?since=0").json
     assert missing["status"] == "not-running"
     assert missing["frames"] == []
+
+
+def test_upload_disabled_returns_403(tmp_path: Path):
+    """Demo instances may disallow user uploads; plays catalog stays usable."""
+    from app import create_app
+
+    app = create_app(
+        {
+            "TESTING": True,
+            "AI_PASSPORT_DATABASE_URL": f"sqlite:///{tmp_path / 'test.sqlite3'}",
+            "AI_PASSPORT_FIRMWARE_DIR": str(tmp_path / "firmware"),
+            "AI_PASSPORT_ALLOW_UPLOAD": False,
+        }
+    )
+    with app.test_client() as test_client:
+        response = test_client.post(
+            "/api/firmware",
+            data={"file": (io.BytesIO(b"malicious-or-not"), "firmware.bin")},
+            content_type="multipart/form-data",
+        )
+        assert response.status_code == 403
+        assert "plays catalog" in response.json["error"]
+
+        # The page still renders, without the upload controls.
+        page = test_client.get("/")
+        assert page.status_code == 200
+        assert b"firmware-file" not in page.data
+    app.extensions["session_manager"].stop_all()

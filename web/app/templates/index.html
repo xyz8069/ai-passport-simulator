@@ -58,10 +58,14 @@
       </div>
       <div class="deck-section firmware-control">
         <div class="section-heading"><span data-i18n="fw.lab">FIRMWARE LAB</span><span class="mono" data-i18n="fw.labSub">ONLY SOURCE OF APP BEHAVIOR</span></div>
+        {% if allow_upload %}
         <div class="firmware-upload-row">
           <label class="file-picker" for="firmware-file"><span id="firmware-file-label" data-i18n="fw.chooseBin">CHOOSE .BIN IMAGE</span><input id="firmware-file" type="file" accept=".bin,application/octet-stream"></label>
           <button id="firmware-upload" class="service-button compact" data-i18n="fw.loadImage">LOAD IMAGE</button>
         </div>
+        {% else %}
+        <div class="firmware-upload-row"><div class="firmware-notice">本实例已禁用固件上传，请从官方玩法目录导入 · Uploads are disabled on this instance; use the official plays catalog.</div></div>
+        {% endif %}
         <select id="firmware-artifact-select" class="firmware-select" aria-label="Validated firmware images">
           <option value="" data-i18n="fw.select.empty">NO VALIDATED IMAGES</option>
         </select>

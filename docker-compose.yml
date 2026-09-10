@@ -9,6 +9,9 @@ services:
     environment:
       # Sign-in-free demo app; the secret only signs Flask session cookies.
       AI_PASSPORT_SECRET_KEY: "${AI_PASSPORT_SECRET_KEY:-change-me-in-production}"
+      # Set to 0 on public demo instances to disable user uploads and keep
+      # only the official plays catalog. Defaults to enabled for self-hosting.
+      AI_PASSPORT_ALLOW_UPLOAD: "${AI_PASSPORT_ALLOW_UPLOAD:-1}"
     volumes:
       # Sessions, validated firmware artifacts, snapshots and input logs.
       - simulator-instance:/app/web/instance

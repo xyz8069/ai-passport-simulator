@@ -1458,11 +1458,12 @@ document.querySelector('#audio-mic').addEventListener('click', async (event) => 
     button.querySelector('b').textContent = t('state.live');
   }
 });
-document.querySelector('#firmware-file').addEventListener('change', (event) => {
+// Upload controls are absent on instances with AI_PASSPORT_ALLOW_UPLOAD=0.
+document.querySelector('#firmware-file')?.addEventListener('change', (event) => {
   lastFirmwareFileName = event.target.files?.[0]?.name || null;
   document.querySelector('#firmware-file-label').textContent = lastFirmwareFileName || t('fw.chooseBin');
 });
-document.querySelector('#firmware-upload').addEventListener('click', () => uploadFirmware().catch(() => setFirmwareNotice(t('upload.failed'), 'error')));
+document.querySelector('#firmware-upload')?.addEventListener('click', () => uploadFirmware().catch(() => setFirmwareNotice(t('upload.failed'), 'error')));
 document.querySelector('#firmware-artifact-select').addEventListener('change', (event) => selectFirmware(Number(event.target.value)));
 document.querySelector('#firmware-analyze').addEventListener('click', () => analyzeFirmware().catch(() => setFirmwareNotice(t('upload.analysisFailed'), 'error')));
 document.querySelector('#firmware-run').addEventListener('click', () => runFirmware().catch(() => setFirmwareNotice(t('run.requestFailed'), 'error')));
