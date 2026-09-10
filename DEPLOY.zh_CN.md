@@ -81,6 +81,23 @@ AI_PASSPORT_SECRET_KEY="$(openssl rand -hex 32)" docker compose up -d --build
 运行中的固件按设计不跨重启：应用启动时会清掉持久化的 RUNNING 标记，因为新
 Web 进程无法重新挂接旧的 QEMU 子进程。会话和固件数据会保留。
 
+## 自动更新（Gitee WebHook）
+
+境内服务器通常连不上 GitHub，但 Gitee 可以直连——用 Gitee 的 WebHook 做
+推送后自动部署，镜像源与触发源就是同一个：
+
+1. **接收器**（`tools/webhook/apx-webhook.py`，纯标准库）：监听一个端口，
+   校验 `X-Gitee-Token` 头与共享密钥（`hmac.compare_digest`），只认
+   `refs/heads/main` 的 push 事件，命中后拉起部署脚本并立即返回 200。
+2. **部署脚本**（`tools/webhook/apx-deploy.sh`）：`flock` 防并发 →
+   `git fetch` Gitee main → HEAD 有变化才 `git reset --hard` →
+   `docker compose build && docker compose up -d` → 健康检查并记录日志。
+3. 两端各注册一个 systemd 服务；云控制台把一个外部端口映射到接收器端口；
+   Gitee 仓库 → 管理 → WebHooks 填入 URL 与密码，事件勾选 Push。
+
+密钥用 `openssl rand -hex 16` 生成、`chmod 600` 存放；两个脚本顶部的路径
+常量按自己的部署目录修改。无新提交时部署脚本秒级返回，不会白跑构建。
+
 ## 常见问题
 
 - **构建时内存不足** —— QEMU 编译每个 `make -j` 任务峰值约 1.5–2 GB。小内存
