@@ -22,6 +22,13 @@ services:
     # VPS; 1 GB fits a handful of concurrent visitors.
     mem_limit: 1g
     cpus: 2
+    # Uploaded firmware runs as real code in QEMU; keep the blast radius of a
+    # hypothetical QEMU escape as small as possible.
+    pids_limit: 256
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   simulator-instance:

@@ -749,6 +749,10 @@ class FirmwareRuntime:
                 "-no-reboot",
                 "-serial", f"file:{serial_log}",
                 "-monitor", "none",
+                # The esp32c3 machine models no NIC, but disable default NIC
+                # creation explicitly so uploaded firmware can never reach a
+                # network backend, whatever the machine default becomes.
+                "-nic", "none",
                 "-drive", f"file={flash_path},if=mtd,format=raw",
             ]
             command[3:3] = ["-L", str(data_dir)]
